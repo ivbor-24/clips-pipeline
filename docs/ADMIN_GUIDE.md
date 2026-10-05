@@ -156,7 +156,7 @@ just restore backups/backup-<дата>.tar   # только при остано�
 
 | Платформа | Статус | Примечание |
 |---|---|---|
-| Ubuntu (Docker, CPU) | проверено | смоук-тест установки с нуля (`scripts/docker_smoke.sh`) на раннере GitHub `ubuntu-latest` (`docker-smoke.yml`, запускается вручную) |
+| Ubuntu (Docker, CPU) | проверено | смоук-тест установки с нуля (`scripts/docker_smoke.sh`) на раннере GitHub `ubuntu-latest` (`docker-smoke.yml`, на каждый pull request) |
 | CachyOS / Arch-based, ядро 7.x (Docker) | проверено | машина разработки: установка `setup.sh`, обновление, полные задачи, Quick Sync, VAAPI-декодирование |
 | NVIDIA (CUDA) | собирается | образ собирается (`docker-cuda.yml`, `just check-cuda-image`), на реальной карте не запускался: машины с NVIDIA у проекта нет — отчёты о работе на NVIDIA очень помогут. Требования: драйвер ≥ 525, NVIDIA Container Toolkit, compute capability карты в `CUDA_ARCHITECTURES` (по умолчанию 75;80;86;89;90;120 в `Dockerfile.backend`) |
 | Intel Arc B580 (Vulkan) | проверено | llama.cpp / whisper.cpp через Vulkan (Mesa), видео через VA-API / Quick Sync |

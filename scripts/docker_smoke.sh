@@ -12,8 +12,8 @@
 #   --video FILE                 the job's input (default: a short lecture
 #                                spoken by espeak-ng)
 #
-# Run it for changes to the Docker installation; .github/workflows/docker-smoke.yml
-# runs it by hand on a GitHub runner. The stack is stopped at the end, also
+# CI runs it on a GitHub runner for pull requests
+# (.github/workflows/docker-smoke.yml). The stack is stopped at the end, also
 # when a step fails.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
