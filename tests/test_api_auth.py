@@ -7,6 +7,7 @@ from pydantic import SecretStr, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from src import __version__
 from src.api.app import app
 from src.api.config import APISettings, settings
 from src.api.database import Base, get_db
@@ -46,7 +47,7 @@ async def test_health_check(client):
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
-    assert data["version"] == "0.8.0"
+    assert data["version"] == __version__
 
 
 class TestNoPassword:
