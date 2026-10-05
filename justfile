@@ -14,7 +14,7 @@ export PATH := justfile_directory() + "/.venv/bin:" + env_var_or_default("PATH",
 clean_env := 'env -i HOME="$HOME" PATH="$PATH" LANG="${LANG:-C.UTF-8}" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1'
 
 # Shell scripts that shellcheck checks (the CI lint job lists the same).
-shell_scripts := "setup.sh scripts/stack.sh scripts/docker_common.sh scripts/dev.sh scripts/web_entrypoint.sh scripts/backup.sh scripts/docker_smoke.sh"
+shell_scripts := "setup.sh scripts/stack.sh scripts/docker_common.sh scripts/dev.sh scripts/web_entrypoint.sh scripts/backup.sh scripts/docker_smoke.sh scripts/publish_images.sh scripts/image_sources.sh"
 
 # Keep the HuggingFace/transformers model caches inside the project,
 # matching the layout Dockerfile.backend uses (artifacts/cache/...). This way
@@ -127,6 +127,10 @@ smoke *args:
 	scripts/docker_smoke.sh {{args}}
 
 # For changes to the image's build (see docker-cuda.yml).
+# Release images to GHCR and their copyleft sources to the GitHub release (docs/RELEASING.md)
+publish-images *args:
+	scripts/publish_images.sh {{args}}
+
 # Build the NVIDIA image and check its CUDA libraries (no GPU needed, ~15 GB of disk)
 check-cuda-image:
 	docker build -f Dockerfile.backend -t clips-pipeline:cuda \

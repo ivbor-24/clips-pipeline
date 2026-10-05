@@ -10,7 +10,15 @@ COPY web/ .
 
 RUN npm run build
 
-FROM nginx:alpine
+# Debian, like the backend image: the source code of every copyleft package in
+# the published images comes from one place (apt-get source, see
+# scripts/image_sources.sh). nginx itself is BSD-licensed.
+FROM nginx:stable-trixie
+
+# The entrypoint polls the API with wget.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wget \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/dist /usr/share/nginx/html
 

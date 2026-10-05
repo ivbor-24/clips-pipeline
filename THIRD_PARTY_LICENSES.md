@@ -56,9 +56,9 @@ CI проверяет файл скриптом `scripts/check_licenses.py` (`ju
 | whisper.cpp | `ggml-org/whisper.cpp`, сборка скриптом `install_whisper_cpp.sh` | MIT |
 | Mesa (`mesa-vulkan-drivers`) | Debian trixie-backports | MIT |
 | Драйвер VA-API Intel и среда Quick Sync (`intel-media-va-driver`, `libmfx-gen1.2`) | Debian | MIT (Intel) |
-| nginx | `nginx:alpine` (`Dockerfile.frontend`) | BSD-2-Clause |
+| nginx | `nginx:stable-trixie` (`Dockerfile.frontend`) | BSD-2-Clause |
 | Python | `python:3.11-slim` | PSF-2.0 |
-| База Debian | `python:3.11-slim` / `node:20-alpine` / `nginx:alpine` | Совокупность свободных лицензий Debian |
+| База Debian | `python:3.11-slim` / `nginx:stable-trixie` (в опубликованных образах); `node:20-alpine` — только для сборки веб-интерфейса, в образ не попадает | Совокупность свободных лицензий Debian; исходники copyleft-пакетов — архив к выпуску |
 | Библиотеки CUDA и cuDNN (только образ `cuda`) | pip-пакеты `nvidia-*` (зависимости torch, extra `cuda` из `uv.lock`) | Проприетарная лицензия NVIDIA; распространение — на условиях NVIDIA |
 
 Пакеты `nvidia-*` из `uv.lock` (extra `cuda`, ставятся вместе с torch): `nvidia-cublas-cu12`,
@@ -224,12 +224,17 @@ MPL-2.0 — слабый copyleft (обязательства только на 
 
 ## Распространение образов
 
-- **ffmpeg (GPL-2.0-or-later):** готовые образы со сборкой ffmpeg из Debian при распространении
-  подпадают под требования GPL. Сейчас образы собираются у пользователя
-  (`./setup.sh` / `docker compose build`), а не публикуются готовыми — это снимает обязательства
-  по предоставлению исходников соответствующих компонентов.
-- **Библиотеки NVIDIA в образе `cuda`** (`nvidia-*`, CUDA и cuDNN) — проприетарные; их
-  перераспространение — только на условиях NVIDIA.
+Готовые образы публикуются в GHCR (`ghcr.io/ivbor-24/clips-pipeline:<версия>-<бэкенд>` и
+`ghcr.io/ivbor-24/clips-pipeline-web:<версия>`, см. `docs/RELEASING.md`).
+
+- **Debian-пакеты под GPL, LGPL, AGPL** (ffmpeg с libx264 и другими кодеками, glibc, Mesa и
+  т. д.): исходники ровно тех версий, что стоят в образах, прикладываются к каждому выпуску
+  на GitHub архивом `clips-pipeline-<версия>-sources.tar` (`scripts/image_sources.sh`), вместе
+  со списком всех пакетов каждого образа. Веб-образ — на Debian (`nginx:stable-trixie`), как и
+  бэкенд, поэтому исходники всех образов собираются одинаково; сам nginx — BSD-2-Clause.
+- **Библиотеки NVIDIA в образе `cuda`** (`nvidia-*`, CUDA и cuDNN) — проприетарные; они приходят
+  pip-пакетами вместе с torch, их лицензии разрешают распространение в составе приложения, а
+  лицензионные файлы лежат в образе рядом с пакетами (`*.dist-info`).
 - **Gemma 4 E4B** (профиль `local_llm`) — применяются условия Google для Gemma, проверить их
   перед включением профиля и использованием.
 - **Лицензия самого проекта — MIT.** Зависимости не накладывают на код ограничений:

@@ -26,7 +26,7 @@ gone=0
 while kill -0 "$NGINX" 2>/dev/null; do
     sleep "$INTERVAL" &
     wait $!
-    if body=$(wget -q -O - -T 3 "$URL" 2>/dev/null); then
+    if body=$(wget -q --tries=1 -O - -T 3 "$URL" 2>/dev/null); then
         gone=0
         case "$body" in *shutting_down*) seen=1 ;; esac
     elif [ "$seen" = 1 ]; then

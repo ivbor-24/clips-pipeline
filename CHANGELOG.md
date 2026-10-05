@@ -4,6 +4,21 @@
 [Keep a Changelog](https://keepachangelog.com/), версии — по
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Добавлено
+
+- Публикация готовых образов со своей машины: `just publish-images [--push]`
+  (`scripts/publish_images.sh`) собирает переносимые образы `openvino`, `cpu`, `cuda` и
+  веб-интерфейса, проверяет их, публикует в GHCR, прикладывает к выпуску на GitHub исходники
+  всех copyleft-пакетов образов (`scripts/image_sources.sh`) и переводит ветку `release` на
+  тег. Порядок выпуска — `docs/RELEASING.md`.
+
+### Изменено
+
+- Веб-образ основан на Debian (`nginx:stable-trixie`), как и бэкенд, а не на Alpine: исходники
+  copyleft-пакетов всех образов собираются одним способом. Образ вырос с ~100 до ~240 МБ.
+
 ## [0.9.0] — 2026-10-05 — первый публичный выпуск
 
 ### Возможности
