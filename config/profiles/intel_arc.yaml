@@ -1,0 +1,11 @@
+# Intel Arc (Vulkan), CPU without AVX2, native install via install.sh.
+# Usage: --profile intel_arc (CLI) or "profile": "intel_arc" in job config_overrides.
+# whisper-cli and the ggml model are symlinked into artifacts/cache (gitignored).
+
+transcription:
+  engine: "whisper_cpp"  # CTranslate2 has no Intel GPU backend
+  whisper_cpp_binary: "artifacts/cache/whisper-cpp-bin/whisper-cli"
+  whisper_cpp_model_path: "artifacts/cache/models/ggml-large-v3-turbo.bin"
+
+rendering:
+  render_timeout_sec: 900  # h264 medium on a slow CPU without AVX2

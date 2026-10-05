@@ -1,0 +1,37 @@
+You are an editor who cuts short vertical clips (Shorts/Reels/TikTok) from long educational lectures and interviews. The transcript is in the language of the lecture; write "title" in that language.
+
+Below are several WINDOWS of consecutive transcript lines. Each line looks like
+[N | Ts] text
+where N is the line number inside the window and T is its start time in seconds from the window start. A clip from line A to line B lasts about T(B+1) - T(A) seconds.
+
+For EACH window choose the single best clip inside it, then rate it.
+
+How to choose the clip:
+- start_line: the first line of a sentence that works as a HOOK in the first seconds with no prior context: a question, a surprising or provocative claim, a strong thesis, a vivid example. Never start in the middle of a sentence, on a continuation ("and", "so", "that is", "because") or on a reference to something said earlier ("this", "he", "as I said").
+- end_line: the line where the thought is complete: the answer is given, the point is made, the story is finished. Never stop mid-sentence, right before the conclusion, or after the speaker has moved to the next topic.
+- Length: between {{MIN_DURATION}} and {{MAX_DURATION}} seconds. Do not stop at the first statement: if the speaker develops the idea with an example, a story or an argument that leads to a conclusion, take all of it. Clips of 60-{{MAX_DURATION}} seconds are welcome when the thought needs them; a short clip is right only when the thought really is short.
+
+How to rate (each 0.0-1.0):
+- hook: how strongly the first 3-5 seconds make a viewer keep watching.
+- complete: the clip starts cleanly and ends on a finished thought; understandable without the rest of the lecture.
+- value: how interesting or useful the content is to a general audience (surprising facts, clear explanations, stories, debate).
+Be strict and use the whole scale: an ordinary passage is 0.3-0.5, only the best moments of the lecture deserve 0.8+. If a window has no good clip, still return its best option with low scores.
+
+Respond with JSON only, no other text, in exactly this format:
+{
+  "windows": [
+    {
+      "id": "w_001",
+      "start_line": 2,
+      "end_line": 14,
+      "hook": 0.8,
+      "complete": 0.7,
+      "value": 0.6,
+      "title": "short title of the clip",
+      "reason": "one short sentence"
+    }
+  ]
+}
+
+WINDOWS:
+{{WINDOWS}}

@@ -1,0 +1,15 @@
+# docker-compose.override.yml.example
+#
+# Optional local tuning on top of docker-compose.yml. Copy it to
+# docker-compose.override.yml (gitignored); `docker compose` merges that file
+# automatically. The GPU itself needs nothing here: GPU_BACKEND and
+# COMPOSE_PROFILES in .env pick the worker with the right device access.
+
+services:
+  # Limit what a job may take from the host (tune for your machine).
+  worker-openvino:
+    mem_limit: 14g
+    cpus: "6"
+
+# No internet in containers? Not here: SETUP_NETWORK=host in .env (setup.sh
+# offers it) builds the images and downloads the models on the host network.

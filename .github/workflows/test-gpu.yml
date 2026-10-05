@@ -1,0 +1,97 @@
+name: CI
+
+# A pull request runs the lint job (~1 min). The full test suite and the
+# Docker checks run by hand here (workflow_dispatch) or on a machine with
+# Docker: `just ci`, `just smoke`, `just check-cuda-image`.
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in sync with UV_VERSION in install.sh and Dockerfile.backend
+  UV_VERSION: "0.12.20"
+  UV_PYTHON: "3.10"
+
+jobs:
+  lint:
+    name: Lint (ruff, black, uv.lock)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install tools
+        # Linter versions: keep in sync with the "dev" extra in pyproject.toml
+        run: pip install "uv==${UV_VERSION}" "black==26.5.1" "ruff==0.16.9"
+
+      - name: uv.lock matches pyproject.toml
+        run: uv lock --check
+
+      - name: ruff
+        run: ruff check src tests scripts
+
+      - name: black
+        run: black --check --diff src tests scripts
+
+      - name: Third-party licenses (THIRD_PARTY_LICENSES.md against the lock files)
+        run: python3 scripts/check_licenses.py
+
+      - name: shellcheck (Docker installation scripts)
+        # shellcheck comes with the runner image.
+        run: shellcheck -x -S warning setup.sh scripts/stack.sh scripts/docker_common.sh scripts/dev.sh scripts/web_entrypoint.sh scripts/backup.sh scripts/docker_smoke.sh
+
+  test-full-suite:
+    name: Full test suite (CPU)
+    # By hand only; `just ci` runs it locally.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache uv downloads and the llama-cpp-python build
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-full-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-full-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        # Exact versions from uv.lock; llama-cpp-python is built from source
+        # for CPU (the built wheel is kept in the uv cache above).
+        run: |
+          pip install "uv==${UV_VERSION}"
+          uv sync --frozen --extra cpu --extra test
+
+      - name: Run full test suite
+        env:
+          # Tests must not download models: KeyBERT falls back to YAKE offline.
+          # Real downloads + CPU inference pushed this job past its timeout.
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: uv run --no-sync pytest tests/ -v --tb=short --durations=10

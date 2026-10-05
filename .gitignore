@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pip-cache/
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+*.env.*
+!.env.example
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dependencies
+.venv/
+venv/
+.mypy_cache/
+
+# Runtime data (jobs, uploads, artifacts, output, database)
+data/
+jobs/
+uploads/
+# Docker bind mounts (docker-compose.yml): cache and default MODELS_DIR
+/cache/
+/models/
+artifacts/
+output/
+input_videos/
+
+# Frontend
+web/node_modules/
+web/dist/
+web/playwright-report/
+web/test-results/
+
+# Local-only files (not for remote repo)
+BACKLOG.md
+summary_spr1205_spr1305.md
+summary_*.md
+brief_*.md
+
+# Deployment artefacts (image tarballs, manifests, compose overrides)
+dist/
+docker-compose.override.yml
+dist/release-manifest.json
+
+# Process groups of the dev services (scripts/dev.sh)
+.run/
+
+# just backup
+backups/
+.env.from-backup
+
+# just eval
+eval/

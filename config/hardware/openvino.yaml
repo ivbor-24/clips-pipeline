@@ -1,0 +1,12 @@
+# Intel Arc / Intel GPUs (GPU_BACKEND=openvino), applied to every job when
+# PIPELINE_HARDWARE=openvino (the Docker image sets it). A user profile
+# (low_vram, ...) is applied on top of it.
+#
+# faster-whisper (CTranslate2) has no Intel GPU backend, so transcription runs
+# through whisper.cpp with Vulkan. The image puts whisper-cli in PATH;
+# `just prefetch-models` downloads the ggml model.
+
+transcription:
+  engine: "whisper_cpp"
+  whisper_cpp_binary: "whisper-cli"
+  whisper_cpp_model_path: "artifacts/cache/models/ggml-large-v3-turbo.bin"

@@ -1,0 +1,96 @@
+# Dependencies are locked in uv.lock. Install with ./install.sh <cpu|cuda|openvino>,
+# or by hand:
+#   uv sync --frozen --extra <cpu|cuda|openvino> --no-install-package llama-cpp-python
+#   scripts/install_llama_cpp_backend.sh <cpu|cuda|openvino>
+
+[project]
+name = "scientific-clips-pipeline"
+version = "0.8.0"
+description = "MVP pipeline for generating vertical scientific clips from lectures"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10,<3.14"  # 3.14: not checked yet
+dependencies = [
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "typer>=0.9.0",
+    "rich>=13.0",
+    "structlog>=24.0",
+    "faster-whisper>=1.0",
+    "keybert>=0.8",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "python-jose[cryptography]>=3.3.0",
+    "python-multipart>=0.0.9",
+    "pydantic-settings>=2.0.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "aiosqlite>=0.20.0",
+    "alembic>=1.13",  # database migrations (src/api/migrations)
+    "httpx>=0.27.0",
+    "llama-cpp-python>=0.3.28",
+    "openai>=1.40",  # scoring.llm.provider openai (and OpenAI-compatible services)
+    "anthropic>=0.40",  # scoring.llm.provider anthropic
+    "huggingface_hub>=0.25.0",
+    "yt-dlp>=2024.0.0",
+    "opencv-python>=4.8.0",  # also the face detector (YuNet, cv2.FaceDetectorYN)
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+# Exactly one backend extra is required: it picks the torch build (CUDA for
+# NVIDIA: its nvidia-*-cu12 packages also serve llama.cpp and CTranslate2).
+# llama-cpp-python is built for the backend by
+# scripts/install_llama_cpp_backend.sh (PyPI ships only its source).
+# onnxruntime (faster-whisper's VAD) is the CPU package for every backend.
+cpu = ["torch>=2.0"]
+cuda = ["torch>=2.0"]
+openvino = ["torch>=2.0"]  # Intel Arc: the GPU runs llama.cpp and whisper.cpp (Vulkan)
+test = ["pytest>=8.0", "pytest-asyncio>=0.23.0"]
+dev = ["black==26.5.1", "ruff==0.16.9", "mypy>=1.0"]  # linters pinned: same as CI
+
+[tool.uv]
+# Linux only; keeps the lock free of macOS/Windows wheels.
+environments = ["sys_platform == 'linux'"]
+conflicts = [[{ extra = "cpu" }, { extra = "cuda" }, { extra = "openvino" }]]
+
+[tool.uv.sources]
+# CPU/Intel machines get the small CPU-only torch; cuda keeps PyPI's CUDA build.
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cpu", extra = "openvino" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test fixtures hold long natural-language sample sentences.
+"tests/**" = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true

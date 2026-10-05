@@ -1,0 +1,72 @@
+# Files and directories excluded from `docker build` context.
+# Keeping this list comprehensive is critical: the build context is sent
+# to the Docker daemon in full, so a 10 GB `input_videos/*.mp4` would
+# otherwise be uploaded on every `docker build`.
+
+# Build artefacts
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# Python
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Heavy runtime artefacts (never ship data in the image)
+output/
+artifacts/cache/
+artifacts/logs/
+artifacts/*.json
+input_videos/
+data/
+jobs/
+uploads/
+# Docker bind mounts: the cache and the default MODELS_DIR (~11 GB of weights)
+cache/
+models/
+
+# Distribution / deployment
+dist/
+*.tar
+*.tar.gz
+*.tgz
+docker-compose.override.yml
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Tests
+tests/
+playwright-report/
+test-results/
+
+# Documentation (not needed at runtime)
+docs/
+*.md
+# ...except the license notices, which go into the image with the code.
+!THIRD_PARTY_LICENSES.md
+
+# Environment
+.env
+.env.*
+
+# Process groups of the dev services (scripts/dev.sh)
+.run/
+
+# just backup
+backups/
+.env.from-backup

@@ -1,0 +1,49 @@
+name: Docker CUDA image
+
+# There is no NVIDIA GPU in CI, so the NVIDIA image is checked by building
+# it: llama.cpp compiled with the CUDA toolkit, and llama.cpp and CTranslate2
+# finding the CUDA 12 libraries they were built for (check_gpu.py
+# --libraries-only).
+#
+# By hand only: a run takes ~40 minutes. When a change touches the image's
+# build (Dockerfile.backend, pyproject.toml, uv.lock,
+# scripts/install_llama_cpp_backend.sh, scripts/ggml_cpu_flags.sh,
+# scripts/check_gpu.py), run it here or locally: `just check-cuda-image`.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Docker build (CUDA)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        # The CUDA toolkit image (~9 GB unpacked), torch with its CUDA
+        # libraries (~6 GB) and the build cache.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup
+          docker system prune -af
+          df -h /
+
+      - name: Build the cuda image
+        # One compute capability (Turing) keeps the build short: this checks
+        # that the image builds and links, not the GPU it runs on.
+        run: |
+          docker build -f Dockerfile.backend -t clips-pipeline:cuda \
+            --build-arg GPU_BACKEND=cuda --build-arg CUDA_ARCHITECTURES=75 .
+          docker image ls clips-pipeline:cuda
+
+      - name: CUDA libraries
+        run: |
+          docker run --rm clips-pipeline:cuda \
+            python scripts/check_gpu.py --backend cuda --libraries-only

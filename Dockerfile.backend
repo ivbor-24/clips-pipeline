@@ -1,0 +1,315 @@
+# Multi-stage Dockerfile for AI Video Clips Pipeline: one image runs both the
+# API and the job worker (docker-compose.yml).
+# Supports: CPU, CUDA (NVIDIA), OpenVINO (Intel Arc); ROCm is not supported.
+#
+# Usually built by `docker compose build` with GPU_BACKEND from .env. By hand:
+#   docker build -f Dockerfile.backend --build-arg GPU_BACKEND=openvino -t clips-pipeline:openvino .
+#
+# The container runs as the host user (compose `user:`), so files it writes to
+# the mounted data/, jobs/, uploads/ stay owned by that user.
+#
+# All tunables are exposed as build args (see ARG declarations below).
+
+ARG GPU_BACKEND=cpu
+ARG UV_VERSION=0.12.20
+# NVIDIA: the CUDA toolkit that compiles llama.cpp. CUDA 12, like the runtime
+# libraries that torch installs (nvidia-*-cu12) and CTranslate2.
+ARG CUDA_VERSION=12.8.1
+
+# =============================================================================
+# Stage 0: Base image with system packages common to all backends
+# =============================================================================
+FROM python:3.11-slim AS base
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Common system packages. GPU-specific packages are added in the gpu-deps stage.
+# Keep this list minimal; add packages only if they are required at runtime.
+# fonts-urw-base35: Nimbus Mono PS, the typewriter subtitle font (Cyrillic).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        fonts-urw-base35 \
+        clinfo \
+        curl \
+        ca-certificates \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# tini gives us proper signal handling (SIGTERM) for uvicorn/workers.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+WORKDIR /app
+
+# =============================================================================
+# Stage 1: GPU vendor runtime + ICD
+# Selected entirely by GPU_BACKEND build arg.
+# =============================================================================
+FROM base AS gpu-deps
+
+ARG GPU_BACKEND=cpu
+
+# Map GPU_BACKEND to the apt packages needed at runtime. The image is built
+# for exactly one backend per `docker build`, so a single RUN block per branch
+# keeps the resulting image small and auditable.
+# llama-cpp-python is compiled from source (python-deps stage below; for cuda
+# in the llama-wheel-cuda stage), so build-essential and cmake are installed
+# for every backend; openvino (Intel Arc) also needs the Vulkan headers and
+# shader compiler. cuda needs nothing here: the CUDA libraries come with torch.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        git \
+    && if [ "$GPU_BACKEND" = "openvino" ]; then \
+        # Vulkan for llama.cpp and whisper.cpp. The Vulkan driver (Mesa) lives
+        # in the image, not on the host, and Arc gets much faster with newer
+        # Mesa: trixie's 25.0 ran Qwen3-14B at half the speed of 26.x, so it
+        # comes from trixie-backports. Face detection runs on the CPU (YuNet),
+        # so Intel's compute runtime is not needed.
+        echo "deb http://deb.debian.org/debian trixie-backports main" \
+            > /etc/apt/sources.list.d/backports.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends -t trixie-backports \
+            mesa-vulkan-drivers \
+        && apt-get install -y --no-install-recommends \
+            libvulkan1 \
+            libvulkan-dev \
+            glslc \
+            spirv-headers; \
+    elif [ "$GPU_BACKEND" = "rocm" ]; then \
+        apt-get install -y --no-install-recommends rocm-opencl-runtime; \
+    fi \
+    && rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# Stage 1a: the llama-cpp-python version, extracted from uv.lock into a tiny
+# file. BuildKit caches `COPY --from=llama-version` by the file's content, so
+# the wheel stages below (and their ~10-40 min llama.cpp compile) are rebuilt
+# only when this version changes — not when any other line of uv.lock does.
+# =============================================================================
+FROM base AS llama-version
+
+COPY uv.lock ./
+RUN awk '/^name = "llama-cpp-python"$/ { found = 1; next } \
+    found && /^version = / { gsub(/"/, "", $3); print $3; exit }' uv.lock \
+    > /llama-version
+
+# =============================================================================
+# Stage 1b: llama-cpp-python wheels, one per backend, compiled with the
+# build toolchain. Every backend writes a wheel into /wheels; python-deps only
+# installs it, so it never compiles llama.cpp itself.
+#
+# cuda compiles on the CUDA toolkit (nvcc, ~8 GB) which is needed only to
+# compile: the image stays on the slim base. At run time the CUDA runtime,
+# cuBLAS and cuDNN come from the nvidia-* pip packages that torch installs
+# (registered with ldconfig in the runtime stage), the driver from the host
+# (NVIDIA Container Toolkit). The other backends compile on gpu-deps, which
+# has build-essential, cmake and, for openvino, the Vulkan headers and shader
+# compiler.
+# =============================================================================
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv-bin
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS llama-wheel-cuda
+
+ARG CPU_TARGET=native
+# GPU compute capabilities to compile for, e.g. 86 (RTX 30). setup.sh puts the
+# GPU's own in .env (a build for one GPU takes minutes, for many much longer).
+# Empty: Turing (RTX 20, GTX 16) to Blackwell (RTX 50). A build container
+# sees no GPU, so ggml's default ("native") cannot be used.
+ARG CUDA_ARCHITECTURES=
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=uv-bin /uv /usr/local/bin/uv
+WORKDIR /build
+# The Python of the base image (python:3.11-slim), so the wheel installs there.
+RUN uv venv --seed --python 3.11 /build/venv
+COPY --from=llama-version /llama-version /llama-version
+COPY scripts/install_llama_cpp_backend.sh scripts/ggml_cpu_flags.sh scripts/build_jobs.sh ./scripts/
+
+ARG BUILD_JOBS
+RUN LLAMA_CPP_VERSION="$(cat /llama-version)" \
+    LLAMA_WHEEL_DIR=/wheels \
+    BUILD_JOBS="${BUILD_JOBS:-}" \
+    BUILD_JOBS_PARALLEL=1 \
+    LLAMA_CMAKE_EXTRA="$(./scripts/ggml_cpu_flags.sh "$CPU_TARGET") -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES:-75;80;86;89;90;120}" \
+    ./scripts/install_llama_cpp_backend.sh cuda /build/venv/bin/python
+
+# cpu / openvino / rocm: one build on gpu-deps; GPU_BACKEND (a single build
+# arg per `docker build`) picks the CMake flags. The three aliases below keep
+# the `llama-wheel-${GPU_BACKEND}` dispatch working.
+FROM gpu-deps AS llama-wheel-gpu
+
+ARG GPU_BACKEND=cpu
+ARG CPU_TARGET=native
+
+COPY --from=llama-version /llama-version /llama-version
+COPY scripts/install_llama_cpp_backend.sh scripts/ggml_cpu_flags.sh scripts/build_jobs.sh ./scripts/
+
+ARG BUILD_JOBS
+RUN LLAMA_CPP_VERSION="$(cat /llama-version)" \
+    LLAMA_WHEEL_DIR=/wheels \
+    BUILD_JOBS="${BUILD_JOBS:-}" \
+    BUILD_JOBS_PARALLEL=1 \
+    LLAMA_CMAKE_EXTRA="$(./scripts/ggml_cpu_flags.sh "$CPU_TARGET")" \
+    ./scripts/install_llama_cpp_backend.sh "$GPU_BACKEND" python3
+
+FROM llama-wheel-gpu AS llama-wheel-cpu
+FROM llama-wheel-gpu AS llama-wheel-openvino
+FROM llama-wheel-gpu AS llama-wheel-rocm
+
+FROM llama-wheel-${GPU_BACKEND} AS llama-wheel
+
+# =============================================================================
+# Stage 2: Python dependencies, exact versions from uv.lock
+# Layered so the heavy install is cached independently of source code.
+# =============================================================================
+FROM gpu-deps AS python-deps
+
+ARG GPU_BACKEND=cpu
+ARG UV_VERSION=0.12.20
+
+ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
+    UV_LINK_MODE=copy \
+    PATH="/app/.venv/bin:$PATH"
+
+RUN pip install --no-cache-dir "uv==${UV_VERSION}"
+
+# Copy only the dependency metadata first so this layer is cached across
+# source-only changes (huge speedup for iterative development). Nothing else:
+# with README.md here every documentation edit recompiled llama.cpp (~8 min).
+# llama.cpp is NOT compiled here: its wheel is built in the llama-wheel-*
+# stages, so a uv.lock change only re-runs `uv sync` (fast), never the compile.
+COPY pyproject.toml uv.lock ./
+
+# One extra per backend picks the torch build. ROCm is not officially
+# supported: it gets the CPU build (only llama.cpp is compiled for the GPU). The project itself is not installed: it runs from
+# /app/src. BuildKit's cache mount keeps uv's download cache out of the image.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    EXTRA="$GPU_BACKEND"; [ "$EXTRA" = "rocm" ] && EXTRA=cpu; \
+    uv sync --frozen --no-install-project --extra "$EXTRA" \
+        --no-install-package llama-cpp-python
+
+# llama-cpp-python, compiled for GPU_BACKEND in the llama-wheel-* stages (the
+# same script as install.sh, so the two never drift apart), installed from the
+# prebuilt wheel. Nothing is compiled here.
+RUN --mount=type=bind,from=llama-wheel,source=/wheels,target=/wheels \
+    uv pip install --python /app/.venv/bin/python --no-deps /wheels/*.whl
+
+# =============================================================================
+# Stage 3: whisper.cpp for Intel GPUs
+# faster-whisper (CTranslate2) has no Intel GPU backend, so the openvino image
+# transcribes with whisper-cli over Vulkan (config/hardware/openvino.yaml).
+# Other backends get an empty directory.
+# =============================================================================
+FROM gpu-deps AS whisper-cpp
+
+ARG GPU_BACKEND=cpu
+ARG CPU_TARGET=native
+
+COPY scripts/install_whisper_cpp.sh scripts/ggml_cpu_flags.sh scripts/build_jobs.sh ./scripts/
+
+# BUILD_JOBS caps the parallel compile jobs so this stage and the
+# llama-cpp-python wheel stage, which build side by side, stay within RAM.
+# Declared right before the RUN that compiles: changing it rebuilds only the
+# compile, not the earlier (cached) layers of the stage.
+ARG BUILD_JOBS
+RUN mkdir -p /opt/whisper.cpp/bin \
+    && if [ "$GPU_BACKEND" = "openvino" ]; then \
+        BUILD_JOBS="${BUILD_JOBS:-}" \
+        BUILD_JOBS_PARALLEL=1 \
+        WHISPER_CPP_BIN_DIR=/opt/whisper.cpp/bin \
+        WHISPER_CMAKE_EXTRA="$(./scripts/ggml_cpu_flags.sh "$CPU_TARGET")" \
+            ./scripts/install_whisper_cpp.sh openvino; \
+    fi
+
+# =============================================================================
+# Stage 4: Runtime (source code + directories)
+# =============================================================================
+FROM python-deps AS runtime
+
+ARG GPU_BACKEND=cpu
+
+COPY --from=whisper-cpp /opt/whisper.cpp /opt/whisper.cpp
+
+# openvino (Intel): the VA-API driver and the Quick Sync runtime, so ffmpeg
+# encodes the clips on the GPU (Debian's ffmpeg has h264_qsv and
+# h264_vaapi, the drivers are separate packages). Installed here, after the
+# llama.cpp build, so adding them does not compile llama.cpp again. NVIDIA
+# needs no package: the Container Toolkit mounts the driver's NVENC library
+# (the "video" capability below).
+RUN if [ "$GPU_BACKEND" = "openvino" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends intel-media-va-driver libmfx-gen1.2 \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Persist the selected backend in image metadata for introspection
+# (visible via `docker inspect` and `docker history`).
+LABEL gpu.backend="${GPU_BACKEND}" \
+      org.opencontainers.image.title="scientific-clips-pipeline" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="https://github.com/ivbor-24/clips-pipeline"
+
+# Application source. The .dockerignore file keeps bulky directories
+# (output/, artifacts/, input_videos/, .venv/, dist/) out of the build
+# context to avoid blowing up the build context transfer.
+COPY LICENSE THIRD_PARTY_LICENSES.md ./
+COPY src/ ./src/
+COPY config/ ./config/
+COPY scripts/ ./scripts/
+
+# Working directories expected by docker-compose volumes and by the CLI. The
+# container runs as the host user, whose UID is unknown here: everything it
+# writes outside the mounts must be writable by any user.
+RUN mkdir -p \
+        data \
+        jobs \
+        uploads \
+        artifacts/logs \
+        artifacts/cache \
+        artifacts/cache/models \
+    && chmod -R a+rwX data jobs uploads artifacts
+
+# cuda: the CUDA 12 libraries of the nvidia-* pip packages (torch's
+# dependencies), for everything that loads them by name: llama.cpp and
+# CTranslate2 (faster-whisper). Nothing on other backends.
+RUN dirs="$(ls -d /app/.venv/lib/python3*/site-packages/nvidia/*/lib 2>/dev/null || true)"; \
+    if [ -n "$dirs" ]; then echo "$dirs" > /etc/ld.so.conf.d/nvidia-pip.conf && ldconfig; fi
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    # Any UID may run the image; libraries that write to ~ get a writable home.
+    HOME=/tmp \
+    # Caches that must outlive the container, in the ./cache mount: above all
+    # Mesa's Vulkan shader cache, without which every job compiles shaders
+    # again before the LLM gets up to speed.
+    XDG_CACHE_HOME=/app/artifacts/cache/xdg \
+    PATH="/opt/whisper.cpp/bin:$PATH" \
+    # NVIDIA Container Toolkit: mount the CUDA driver, nvidia-smi and NVENC.
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
+    # config/hardware/<backend>.yaml is applied to every job.
+    PIPELINE_HARDWARE=${GPU_BACKEND} \
+    # All model weights live in the models mount (MODELS_DIR in .env): GGUF,
+    # ggml and ONNX (face detector) files and the Hugging Face cache
+    # (faster-whisper, KeyBERT).
+    HF_HOME=/app/artifacts/cache/models/huggingface \
+    TRANSFORMERS_CACHE=/app/artifacts/cache/models/huggingface
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -fsS http://localhost:8000/api/v1/health || exit 1
+
+# Default to the FastAPI server; the worker service runs `python -m src.worker`
+# and turns this health check off. Override with `python3 -m src.cli process ...`
+# for batch / one-shot runs. src.api.serve (uvicorn
+# underneath) exits with code 0 after a shutdown from the web UI, so
+# `restart: on-failure` does not start it again.
+CMD ["python", "-m", "src.api.serve"]

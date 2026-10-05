@@ -1,0 +1,14 @@
+# Low VRAM Profile - Optimized for 8 GB VRAM GPUs
+# Usage: --profile low_vram
+
+transcription:
+  model: "small"
+  compute_type: "int8"
+  batch_size: 2
+
+scoring:
+  max_clips_per_video: 3
+
+gpu:
+  backend: "auto"
+  whisper_compute_override: "int8"

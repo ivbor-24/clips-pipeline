@@ -1,0 +1,149 @@
+# Clips pipeline: web UI (nginx) -> API -> job worker.
+#
+# One image (Dockerfile.backend) runs the API and the worker; the worker gets
+# the GPU. Settings come from .env (template: .env.example):
+#   GPU_BACKEND       cpu | cuda | openvino - which image to build
+#   COMPOSE_PROFILES  the same value        - which worker to start
+#   HOST_UID, HOST_GID, RENDER_GID, MODELS_DIR, BIND_ADDRESS, WEB_PORT,
+#   SETUP_NETWORK
+#
+#   ./setup.sh     # writes .env, builds, downloads the models, starts
+#   just up / just stop / just status
+#
+# Only the web UI is published, on 127.0.0.1 unless BIND_ADDRESS says
+# otherwise. Set API_PASSWORD before opening it to the network.
+
+x-mounts: &mounts
+  # Bind mounts owned by the host user; they must exist (create_host_path:
+  # false), otherwise Docker would create them owned by root.
+  - {type: bind, source: ./data, target: /app/data, bind: {create_host_path: false}}
+  - {type: bind, source: ./jobs, target: /app/jobs, bind: {create_host_path: false}}
+  - {type: bind, source: ./uploads, target: /app/uploads, bind: {create_host_path: false}}
+  # Read-only: config/config.yaml is tracked by git (a rewritten copy would
+  # block `git pull`); the Settings page saves to data/settings.yaml instead.
+  - {type: bind, source: ./config, target: /app/config, read_only: true, bind: {create_host_path: false}}
+  # Transcription cache and other rebuildable data.
+  - {type: bind, source: ./cache, target: /app/artifacts/cache, bind: {create_host_path: false}}
+  # Model weights (~11 GB with Qwen3-14B). Point MODELS_DIR at a directory
+  # that already has them to avoid downloading again.
+  - {type: bind, source: "${MODELS_DIR:-./models}", target: /app/artifacts/cache/models, bind: {create_host_path: false}}
+
+x-app: &app
+  image: clips-pipeline:${GPU_BACKEND:-cpu}
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  volumes: *mounts
+  # Restart after a crash, but not after a clean stop: the "Shut down" button
+  # must stay stopped. After a host reboot start it with
+  # `docker compose up -d`; unfinished jobs continue from their last stage.
+  restart: on-failure
+
+x-worker: &worker
+  <<: *app
+  # The image is built by the backend service; never look for it in a registry.
+  pull_policy: never
+  command: ["python", "-m", "src.worker"]
+  environment:
+    API_DATABASE_URL: ${API_DATABASE_URL:-sqlite+aiosqlite:///./data/api.db}
+    # Jobs never touch the network: models come from the prefetch step
+    # (setup.sh, or `docker compose run --rm prefetch-models`).
+    # Otherwise KeyBERT asks Hugging Face for updates on every job and hangs
+    # for minutes when there is no internet.
+    HF_HUB_OFFLINE: "1"
+    # Needed only for gated Hugging Face repos (profile local_llm: Gemma).
+    HF_TOKEN: ${HF_TOKEN:-}
+    # Only for scoring.llm.provider openai / anthropic (off by default).
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  # The image's health check probes the API, which the worker does not run.
+  healthcheck:
+    disable: true
+  # SIGTERM puts the running job back in the queue; give it time to stop its
+  # ffmpeg / whisper processes.
+  stop_grace_period: 30s
+
+services:
+  backend:
+    <<: *app
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      # host when the Docker network has no internet access (setup.sh checks).
+      network: ${SETUP_NETWORK:-default}
+      args:
+        GPU_BACKEND: ${GPU_BACKEND:-cpu}
+        # NVIDIA: compute capabilities to compile llama.cpp for (setup.sh
+        # detects them); empty compiles for RTX 20 to RTX 50.
+        CUDA_ARCHITECTURES: ${CUDA_ARCHITECTURES:-}
+        # Parallel compile jobs for whisper.cpp and llama-cpp-python. Empty:
+        # automatic (fit the host's RAM). setup.sh lowers it after an OOM.
+        BUILD_JOBS: ${BUILD_JOBS:-}
+    # Reached only through the web UI container (nginx); not published.
+    expose:
+      - "8000"
+    environment:
+      # Empty API_PASSWORD: no login (one built-in user). With a password the
+      # API refuses to start unless API_JWT_SECRET is a random 16+ char string.
+      API_PASSWORD: ${API_PASSWORD:-}
+      API_JWT_SECRET: ${API_JWT_SECRET:-}
+      API_SESSION_DAYS: ${API_SESSION_DAYS:-30}
+      API_MAX_UPLOAD_GB: ${API_MAX_UPLOAD_GB:-10}
+      # Shut down after this many minutes without open web pages and jobs; 0: never.
+      API_IDLE_SHUTDOWN_MIN: ${API_IDLE_SHUTDOWN_MIN:-60}
+      API_DATABASE_URL: ${API_DATABASE_URL:-sqlite+aiosqlite:///./data/api.db}
+      API_CORS_ORIGINS: ${API_CORS_ORIGINS:-http://localhost:5173,http://localhost}
+      API_LOG_LEVEL: ${API_LOG_LEVEL:-INFO}
+
+  # One worker per GPU backend; COMPOSE_PROFILES in .env starts the right one.
+  worker-cpu:
+    <<: *worker
+    profiles: ["cpu"]
+
+  worker-cuda:
+    <<: *worker
+    profiles: ["cuda"]
+    # Needs the NVIDIA Container Toolkit on the host.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  worker-openvino:
+    <<: *worker
+    profiles: ["openvino"]
+    # Intel GPU for Vulkan (llama.cpp, whisper.cpp). The render
+    # group's GID differs between hosts: .env sets it (getent group render).
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${RENDER_GID:-render}"
+
+  # Downloads the models into MODELS_DIR: docker compose run --rm prefetch-models
+  # (setup.sh runs it). Not started by `docker compose up`.
+  prefetch-models:
+    <<: *app
+    profiles: ["tools"]
+    pull_policy: never
+    command: ["python", "scripts/prefetch_models.py"]
+    restart: "no"
+    # The only service that needs the internet; host when the Docker network
+    # has no internet access (SETUP_NETWORK in .env, setup.sh checks).
+    network_mode: ${SETUP_NETWORK:-bridge}
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    healthcheck:
+      disable: true
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      network: ${SETUP_NETWORK:-default}
+    image: clips-pipeline-web:latest
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8080}:80"
+    depends_on:
+      - backend
+    restart: on-failure

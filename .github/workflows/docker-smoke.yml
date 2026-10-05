@@ -1,0 +1,40 @@
+name: Docker smoke test
+
+# Installation from scratch the way docs/INSTALL.md describes it: ./setup.sh builds
+# the CPU image, `just up` starts it, one small job runs through the web UI,
+# `just stop` stops it. Nothing is published. The steps are
+# scripts/docker_smoke.sh.
+#
+# By hand only: a run takes ~13 of the scarce GitHub Actions minutes. The test
+# machine runs the same script in a fresh clone: `just smoke`.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Docker install from scratch (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        # The CPU image is ~4 GB and its build cache about as much again.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
+
+      - name: Install just, ffmpeg and espeak-ng
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just ffmpeg espeak-ng
+
+      - name: Install from scratch, one job through the web UI, stop
+        run: scripts/docker_smoke.sh --backend cpu

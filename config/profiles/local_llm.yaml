@@ -1,0 +1,23 @@
+# Profile: local_llm
+# Uses the official Gemma 4 E4B Q4_0 GGUF model via llama.cpp.
+# On first run the ~5.15 GB GGUF will be downloaded from Hugging Face.
+# Set HF_TOKEN and accept the model terms before running.
+
+scoring:
+  llm:
+    enabled: true
+    provider: "llama_cpp"
+    model: "google/gemma-4-E4B-it-qat-q4_0-gguf"
+    model_repo: "google/gemma-4-E4B-it-qat-q4_0-gguf"
+    model_file: "gemma-4-E4B_q4_0-it.gguf"
+    model_path: null
+    n_ctx: 4096
+    n_gpu_layers: -1
+    n_batch: 512
+    top_p: 0.95
+    chat_format: null
+    temperature: 0.7
+    max_tokens: 1000
+    llm_weight: 0.4
+    download_if_missing: true
+    verbose: false
