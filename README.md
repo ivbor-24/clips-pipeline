@@ -103,6 +103,7 @@ just smoke               # установка с нуля в Docker и одна 
   только миграциями Alembic (`just db-revision "что меняется"`).
 - **Новая зависимость** — строка с её лицензией в
   [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md); lint это проверяет.
+- **Выпуск версии и публикация образов** — [docs/RELEASING.md](docs/RELEASING.md).
 - **CI** на каждый pull request: lint, все тесты и установка с нуля в Docker
   с одной задачей; при изменении сборки образа — ещё сборка образа для NVIDIA.
   Локально то же самое: `just ci`, `just smoke`, `just check-cuda-image`.

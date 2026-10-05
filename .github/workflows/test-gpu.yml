@@ -52,7 +52,7 @@ jobs:
 
       - name: shellcheck (Docker installation scripts)
         # shellcheck comes with the runner image.
-        run: shellcheck -x -S warning setup.sh scripts/stack.sh scripts/docker_common.sh scripts/dev.sh scripts/web_entrypoint.sh scripts/backup.sh scripts/docker_smoke.sh
+        run: shellcheck -x -S warning setup.sh scripts/stack.sh scripts/docker_common.sh scripts/dev.sh scripts/web_entrypoint.sh scripts/backup.sh scripts/docker_smoke.sh scripts/publish_images.sh scripts/image_sources.sh
 
   test-full-suite:
     name: Full test suite (CPU)
