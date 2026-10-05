@@ -37,6 +37,9 @@ class _State:
     def __init__(self) -> None:
         self.requested_at: Optional[datetime] = None
         self.last_activity = time.monotonic()
+        # The task that waits for the worker and then stops the API. Kept here:
+        # the event loop holds only a weak reference to a task.
+        self.finish_task: Optional[asyncio.Task] = None
 
 
 state = _State()
@@ -85,7 +88,7 @@ async def request_shutdown(
     await db.commit()
     state.requested_at = now
     logger.info("shutdown_requested", mode=mode, reason=reason)
-    asyncio.get_running_loop().create_task(_finish(session_factory, now))
+    state.finish_task = asyncio.get_running_loop().create_task(_finish(session_factory, now))
     return now
 
 
