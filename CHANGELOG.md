@@ -4,7 +4,7 @@
 [Keep a Changelog](https://keepachangelog.com/), версии — по
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — первый публичный выпуск
+## [0.9.0] — 2026-10-05 — первый публичный выпуск
 
 ### Возможности
 
