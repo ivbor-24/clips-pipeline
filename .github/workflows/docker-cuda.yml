@@ -5,12 +5,20 @@ name: Docker CUDA image
 # finding the CUDA 12 libraries they were built for (check_gpu.py
 # --libraries-only).
 #
-# By hand only: a run takes ~40 minutes. When a change touches the image's
-# build (Dockerfile.backend, pyproject.toml, uv.lock,
-# scripts/install_llama_cpp_backend.sh, scripts/ggml_cpu_flags.sh,
-# scripts/check_gpu.py), run it here or locally: `just check-cuda-image`.
+# Pull requests that change the image's build (~40 min). Locally the same:
+# `just check-cuda-image`.
 
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - Dockerfile.backend
+      - pyproject.toml
+      - uv.lock
+      - scripts/install_llama_cpp_backend.sh
+      - scripts/ggml_cpu_flags.sh
+      - scripts/check_gpu.py
+      - .github/workflows/docker-cuda.yml
   workflow_dispatch:
 
 concurrency:

@@ -1,10 +1,11 @@
 name: CI
 
-# A pull request runs the lint job (~1 min). The full test suite and the
-# Docker checks run by hand here (workflow_dispatch) or on a machine with
-# Docker: `just ci`, `just smoke`, `just check-cuda-image`.
+# Lint and the full test suite (CPU) for every pull request and every push to
+# main. Locally the same: `just ci`.
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
     paths-ignore: ["**.md", "docs/**"]
@@ -55,8 +56,6 @@ jobs:
 
   test-full-suite:
     name: Full test suite (CPU)
-    # By hand only; `just ci` runs it locally.
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
