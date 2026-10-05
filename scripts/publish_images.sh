@@ -121,6 +121,8 @@ The project's own code is MIT-licensed: https://github.com/$GH_REPO/tree/$TAG
 EOF
 ARCHIVE=$OUT/clips-pipeline-$VERSION-sources.tar
 (cd "$OUT" && tar -cf "$(basename "$ARCHIVE")" README.txt sources.txt packages-*.txt sources)
+# The archive holds them now; ~1.2 GB less on the disk.
+rm -rf "$OUT/sources"
 echo "Archive: $ARCHIVE ($(du -h "$ARCHIVE" | cut -f1))"
 
 if [[ "$PUSH" != true ]]; then
