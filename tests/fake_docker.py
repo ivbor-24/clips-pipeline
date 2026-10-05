@@ -10,14 +10,17 @@ so a test sets up the "system" by writing files:
 - ``llm_status``: output of ``scripts/llm_provider.py status`` (default: the
   local model, not downloaded yet);
 - ``logs``: what `compose logs` prints;
-- ``restarting``: containers in a restart loop (`ps --status restarting`).
+- ``restarting``: containers in a restart loop (`ps --status restarting`);
+- ``published``: published images, "<ref> <commit>" per line
+  (`buildx imagetools inspect`).
 
 Environment knobs: FAKE_DOCKER_INFO_ERR (docker info fails with it),
 FAKE_RUNTIMES, FAKE_COMPOSE_VERSION, FAKE_NO_BUILDX, FAKE_IMAGE_MISSING,
 FAKE_NET_BRIDGE / FAKE_NET_HOST (exit code of the internet probe),
 FAKE_CHECK_GPU_RC, FAKE_WEB_PORT (`compose up -d` starts a fake web UI there),
 FAKE_RECREATE (`compose up -d` recreates running containers, as after a rebuild),
-FAKE_LLM_CHECK_FAIL (`llm_provider.py check` fails with this message).
+FAKE_LLM_CHECK_FAIL (`llm_provider.py check` fails with this message),
+FAKE_PULL_FAIL (pulling a ghcr.io image fails).
 """
 
 import os
@@ -39,6 +42,14 @@ case "$args" in
     " version "*) echo "27.0.3" ;;
     " compose version "*) echo "${FAKE_COMPOSE_VERSION:-2.29.1}" ;;
     " buildx version "*) [[ -z "${FAKE_NO_BUILDX:-}" ]] ;;
+    " buildx imagetools inspect "*)
+        # Published images: "<ref> <commit>" lines in $FAKE_STATE/published.
+        ref=$(echo "$*" | awk '{print $4}')
+        sha=$(awk -v r="$ref" '$1 == r {print $2}' "$state/published" 2>/dev/null)
+        [[ -n "$sha" ]] || { echo "ERROR: not found: $ref" >&2; exit 1; }
+        echo "{\"config\":{\"Labels\":{\"org.opencontainers.image.revision\":\"$sha\"}}}" ;;
+    " pull "*ghcr.io*) [[ -z "${FAKE_PULL_FAIL:-}" ]] ;;
+    " tag "*) ;;
     " image inspect "*) [[ -z "${FAKE_IMAGE_MISSING:-}" ]] ;;
     " pull "*) ;;
     " run "*"--network host"*) exit "${FAKE_NET_HOST:-0}" ;;

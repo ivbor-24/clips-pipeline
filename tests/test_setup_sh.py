@@ -595,3 +595,106 @@ class TestLLM:
 
         assert result.returncode == 1
         assert "cannot reach API providers" in result.stdout
+
+
+def make_release_checkout(env, version="1.2.3") -> str:
+    """Turn the project copy into a git checkout of a release; returns its commit."""
+    project = env["project"]
+    (project / "src").mkdir(exist_ok=True)
+    (project / "src/__init__.py").write_text(f'__version__ = "{version}"\n')
+    for args in (
+        ["init", "-q"],
+        ["add", "-A"],
+        ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "release"],
+    ):
+        subprocess.run(["git", *args], cwd=project, check=True, capture_output=True)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def publish(env, sha, backend="cpu", version="1.2.3"):
+    (env["state"] / "published").write_text(
+        f"ghcr.io/ivbor-24/clips-pipeline:{version}-{backend} {sha}\n"
+        f"ghcr.io/ivbor-24/clips-pipeline-web:{version} {sha}\n"
+    )
+
+
+class TestPublishedImages:
+    """A release checkout downloads its images instead of compiling them."""
+
+    def run(self, env, *args, **extra):
+        # PATH holds only the fakes and SYSTEM_TOOLS; git is needed here.
+        add_command(env["bin"], "git", f'exec {shutil.which("git")} "$@"\n')
+        return run_setup(env, "--backend", "cpu", *QUICK, *args, **extra)
+
+    def test_release_checkout_downloads_the_published_images(self, env):
+        publish(env, make_release_checkout(env))
+
+        result = self.run(env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        calls = docker_calls(env)
+        assert "pull ghcr.io/ivbor-24/clips-pipeline:1.2.3-cpu" in calls
+        assert "pull ghcr.io/ivbor-24/clips-pipeline-web:1.2.3" in calls
+        assert "tag ghcr.io/ivbor-24/clips-pipeline:1.2.3-cpu clips-pipeline:cpu" in calls
+        assert "tag ghcr.io/ivbor-24/clips-pipeline-web:1.2.3 clips-pipeline-web:latest" in calls
+        assert "compose build" not in calls
+        assert "nothing to compile" in result.stdout
+
+    def test_images_of_another_commit_are_not_used(self, env):
+        make_release_checkout(env)
+        publish(env, "0" * 40)
+
+        result = self.run(env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "compose build" in docker_calls(env)
+        assert "pull ghcr.io" not in docker_calls(env)
+        assert "no published images of this commit" in result.stdout
+
+    def test_local_changes_to_the_code_build_here(self, env):
+        publish(env, make_release_checkout(env))
+        (env["project"] / "src/__init__.py").write_text('__version__ = "1.2.3"  # mine\n')
+
+        result = self.run(env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "compose build" in docker_calls(env)
+        assert "imagetools" not in docker_calls(env)
+        assert "local changes to the code" in result.stdout
+
+    def test_changes_to_the_config_do_not_matter(self, env):
+        (env["project"] / "config").mkdir()
+        (env["project"] / "config/config.yaml").write_text("a: 1\n")
+        publish(env, make_release_checkout(env))
+        (env["project"] / "config/config.yaml").write_text("a: 2\n")
+
+        result = self.run(env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "compose build" not in docker_calls(env)
+
+    def test_build_flag_builds_without_asking_the_registry(self, env):
+        publish(env, make_release_checkout(env))
+
+        result = self.run(env, "--build")
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "compose build" in docker_calls(env)
+        assert "imagetools" not in docker_calls(env)
+
+    def test_not_a_git_checkout_builds(self, env):
+        result = run_setup(env, "--backend", "cpu", *QUICK)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "compose build" in docker_calls(env)
+        assert "not a git checkout" in result.stdout
+
+    def test_failed_download_suggests_building_here(self, env):
+        publish(env, make_release_checkout(env))
+
+        result = self.run(env, FAKE_PULL_FAIL="1")
+
+        assert result.returncode == 1
+        assert "./setup.sh --build" in result.stderr

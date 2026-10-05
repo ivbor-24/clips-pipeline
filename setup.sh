@@ -7,17 +7,21 @@
 #   --yes                        take the default answers instead of asking
 #   --no-models                  do not download the models
 #   --no-start                   do not start the web UI at the end
+#   --build                      build the images here even if published ones fit
 #
 # Checks Docker, detects the GPU, writes .env (keeping the values already
-# there), creates the data directories, builds the images, downloads the
-# models, checks that the job worker really uses the GPU and starts the web
-# UI. Run it again after `git pull`: it rebuilds and keeps the settings.
+# there), creates the data directories, downloads the published images of
+# this release (or builds them when the code is not a published release),
+# downloads the models, checks that the job worker really uses the GPU and
+# starts the web UI. Run it again after `git pull`: it updates the images and
+# keeps the settings.
 #
 # Environment (used by the tests):
 #   SETUP_DRM_DIR         where to look for GPUs (default: /sys/class/drm)
 #   SETUP_DEV_DRI         GPU device nodes (default: /dev/dri)
 #   SETUP_NEED_GB_IMAGES  free space for the images and build cache (default: 20)
 #   SETUP_NEED_GB_MODELS  free space for the models (default: 12)
+#   SETUP_IMAGE_REPO      published images (default: ghcr.io/ivbor-24/clips-pipeline)
 set -euo pipefail
 
 # shellcheck source=scripts/docker_common.sh
@@ -38,6 +42,11 @@ BACKEND_FLAG=""
 MODELS_DIR_FLAG=""
 NO_MODELS=false
 NO_START=false
+BUILD_FLAG=false
+IMAGE_REPO="${SETUP_IMAGE_REPO:-ghcr.io/ivbor-24/clips-pipeline}"
+# What goes into the images (Dockerfile.backend, Dockerfile.frontend): with
+# changes there the published images do not fit. config/ is mounted instead.
+IMAGE_INPUTS=(src scripts web Dockerfile.backend Dockerfile.frontend pyproject.toml uv.lock nginx.conf)
 
 # Set while the script runs.
 BACKEND=""
@@ -51,12 +60,16 @@ LLM_PROVIDER=""
 LLM_MODEL=""
 LLM_API_BASE=""
 LLM_READY=""
+# The published images of this exact commit (find_published_images), empty
+# when the images are built here.
+PUBLISHED_BACKEND=""
+PUBLISHED_WEB=""
 # Output of the last `docker compose build` (build_once sets it; build_images
 # reads it to tell an out-of-memory kill apart from other failures).
 BUILD_LOG=""
 
 usage() {
-    sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 step() { echo -e "\n${C_CYAN}━━━ $* ━━━${C_OFF}"; }
@@ -88,6 +101,7 @@ parse_args() {
             --yes | -y) ASSUME_YES=true ;;
             --no-models) NO_MODELS=true ;;
             --no-start) NO_START=true ;;
+            --build) BUILD_FLAG=true ;;
             -h | --help)
                 usage
                 exit 0 ;;
@@ -391,6 +405,11 @@ check_disk() {
     # NVIDIA: the CUDA toolkit image (~9 GB, only for compiling) and torch's
     # CUDA libraries.
     [[ "$BACKEND" == cuda ]] && need_images=$((need_images + 10))
+    # Downloaded images: ~5 GB (openvino, cpu) or ~10 GB (cuda), no build cache.
+    if [[ -n "$PUBLISHED_BACKEND" ]]; then
+        need_images=8
+        [[ "$BACKEND" == cuda ]] && need_images=14
+    fi
     # A rebuild reuses most of the image and the build cache.
     docker image inspect "clips-pipeline:$BACKEND" >/dev/null 2>&1 && need_images=5
     need_models=${SETUP_NEED_GB_MODELS:-12}
@@ -417,7 +436,60 @@ check_disk() {
     info "Disk space: OK"
 }
 
-# ---- 5. Network and build ---------------------------------------------------
+# ---- 5. Images: download or build -------------------------------------------
+
+# image_revision IMAGE: the commit a published image was built from (its
+# org.opencontainers.image.revision label), read from the registry without
+# downloading the image; empty when there is no such image.
+image_revision() {
+    docker buildx imagetools inspect "$1" --format '{{json .Image}}' 2>/dev/null |
+        grep -o '"org.opencontainers.image.revision":"[0-9a-f]*"' | head -n 1 |
+        cut -d'"' -f4 || true
+}
+
+# find_published_images: the published images fit when this checkout is a
+# release whose images were built from this very commit (the release branch,
+# a release tag) and nothing that goes into the images was changed here.
+find_published_images() {
+    local version sha changes
+    if [[ "$BUILD_FLAG" == true ]]; then
+        info "Images: built here (--build)."
+        return
+    fi
+    if ! sha=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null); then
+        info "Images: built here (not a git checkout, so no published images to match)."
+        return
+    fi
+    changes=$(git -C "$ROOT" status --porcelain -- "${IMAGE_INPUTS[@]}" 2>/dev/null)
+    if [[ -n "$changes" ]]; then
+        info "Images: built here (local changes to the code)."
+        return
+    fi
+    version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/__init__.py)
+    if [[ "$(image_revision "$IMAGE_REPO:$version-$BACKEND")" != "$sha" ||
+        "$(image_revision "$IMAGE_REPO-web:$version")" != "$sha" ]]; then
+        info "Images: built here (no published images of this commit; releases have them:" \
+            "git clone -b release, see docs/INSTALL.md)."
+        return
+    fi
+    PUBLISHED_BACKEND=$IMAGE_REPO:$version-$BACKEND
+    PUBLISHED_WEB=$IMAGE_REPO-web:$version
+    info "Images: the published ones of version $version ($PUBLISHED_BACKEND), nothing to compile."
+}
+
+# pull_images: download the published images under the names
+# docker-compose.yml uses, so `docker compose up` does not build them.
+pull_images() {
+    info "Downloading the images (~$([[ "$BACKEND" == cuda ]] && echo 10 || echo 5) GB)..."
+    docker pull "$PUBLISHED_BACKEND" ||
+        die "Downloading $PUBLISHED_BACKEND failed (see above). Run ./setup.sh again," \
+            "or build the images here: ./setup.sh --build"
+    docker pull "$PUBLISHED_WEB" ||
+        die "Downloading $PUBLISHED_WEB failed (see above). Run ./setup.sh again," \
+            "or build the images here: ./setup.sh --build"
+    docker tag "$PUBLISHED_BACKEND" "clips-pipeline:$BACKEND"
+    docker tag "$PUBLISHED_WEB" "clips-pipeline-web:latest"
+}
 
 check_network() {
     local base probe network
@@ -776,11 +848,17 @@ main() {
     step "3/7 Settings (.env)"
     write_env
     step "4/7 Directories and disk space"
+    find_published_images
     make_dirs
     check_disk
-    step "5/7 Building the images"
+    step "5/7 Images"
+    # Also for downloaded images: the models are downloaded from a container.
     check_network
-    build_images
+    if [[ -n "$PUBLISHED_BACKEND" ]]; then
+        pull_images
+    else
+        build_images
+    fi
     step "6/7 Models and GPU check"
     models_and_gpu_check
     step "7/7 Start"
