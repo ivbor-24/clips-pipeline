@@ -75,6 +75,9 @@ packages = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+# A test stuck this long prints the stacks of all threads (CI cancels the job
+# after 25 minutes without saying where it hung).
+faulthandler_timeout = 300
 
 [tool.black]
 line-length = 100

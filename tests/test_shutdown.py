@@ -1,6 +1,7 @@
 """Tests for the shutdown from the web UI and after idle time."""
 
 import asyncio
+import contextlib
 import os
 import shutil
 import signal
@@ -187,6 +188,14 @@ async def api(tmp_path):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             yield client, factory
     app.dependency_overrides.clear()
+    # A shutdown the test started keeps polling the database for the worker:
+    # stop it before the engine goes. Otherwise the event loop's teardown could
+    # wait forever on its open aiosqlite connection (CI hung here for 25 min).
+    task = shutdown.state.finish_task
+    if task is not None and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
     await engine.dispose()
 
 
@@ -249,6 +258,8 @@ class TestIdleWatchdog:
             task = asyncio.create_task(shutdown.idle_watchdog(factory, minutes))
             await asyncio.sleep(0.2)
             task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     @pytest.mark.asyncio
     async def test_idle_without_jobs_shuts_down(self, api):
