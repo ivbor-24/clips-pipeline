@@ -52,7 +52,7 @@ esac
 FAKE_CURL = r"""#!/usr/bin/env bash
 echo "curl $*" >>"$STATE/curl.log"
 case "$*" in
-    *"/releases/tags/"*) echo '{"id": 42}' ;;
+    *"/releases?per_page=100") echo '[{"id": 41, "tag_name": "v1.0.0"}, {"id": 42, "tag_name": "v1.2.3", "draft": true}]' ;;
     *"/releases/42/assets") echo '[{"id": 7, "name": "other.tar"}]' ;;
     *) ;;
 esac

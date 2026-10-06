@@ -153,9 +153,11 @@ docker logout "$REGISTRY" >/dev/null
 
 step "Upload the sources to the release $TAG"
 api() { curl -fsS -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" "$@"; }
-RELEASE_ID=$(api "https://api.github.com/repos/$GH_REPO/releases/tags/$TAG" |
-    python3 -c 'import json, sys; print(json.load(sys.stdin)["id"])') ||
-    die "No GitHub release for $TAG: create it first."
+# The release list, not releases/tags/<tag>: the latter skips drafts, and a
+# release stays a draft until its images and sources are in place.
+RELEASE_ID=$(api "https://api.github.com/repos/$GH_REPO/releases?per_page=100" |
+    python3 -c "import json, sys; print(''.join(str(r['id']) for r in json.load(sys.stdin) if r['tag_name'] == '$TAG'))")
+[[ -n "$RELEASE_ID" ]] || die "No GitHub release (or draft) for $TAG: create it first."
 NAME=$(basename "$ARCHIVE")
 OLD=$(api "https://api.github.com/repos/$GH_REPO/releases/$RELEASE_ID/assets" |
     python3 -c "import json, sys; print(''.join(str(a['id']) for a in json.load(sys.stdin) if a['name'] == '$NAME'))")
