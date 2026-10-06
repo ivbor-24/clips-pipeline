@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # Build the release images on this machine and publish them: the backend image
 # for each GPU backend and the web UI image to GHCR, the source code of their
-# copyleft packages to the GitHub release, and the release branch to the tag.
+# copyleft packages to the GitHub release. Publishing the release and moving
+# the release branch to the tag stay the last, separate steps
+# (docs/RELEASING.md).
 #
-# Run it in a clean checkout of a release tag vX.Y.Z (X.Y.Z = src/__init__.py).
+# Usage: scripts/publish_images.sh [--push] [--backends "openvino cpu cuda"] [--checkout DIR]
+#   without --push  build and check every image, collect the sources into
+#                   dist/release-X.Y.Z/ of the checkout
+#   --push          also publish: each image is pushed right after its check
+#                   and removed here (the disk holds one image at a time),
+#                   then the sources go to the release (a draft is fine)
+#   --checkout DIR  the release checkout to build (default: this repository),
+#                   e.g. a tag whose own copy of this script is older
 #
-# Usage: scripts/publish_images.sh [--push] [--backends "openvino cpu cuda"]
-#   without --push  build, check and collect the sources into dist/release-X.Y.Z/
-#   --push          then push the images, upload the sources to the release
-#                   and move the release branch to the tag
-#
+# Run it on a clean checkout of a release tag vX.Y.Z (X.Y.Z = src/__init__.py).
 # The images are portable (CPU_TARGET=portable: any x86-64 CPU with AVX); the
 # NVIDIA one is compiled for all GPUs from RTX 20 to RTX 50.
 #
@@ -19,10 +24,9 @@
 #   BUILD_NETWORK  default "default"; host where Docker's network has no internet
 #   BUILD_JOBS     parallel compile jobs (empty: automatic)
 # Needs docker with buildx, git, curl, python3, and a GitHub token with
-# write:packages in git's credential helper (git credential fill; git push to
-# origin uses it too).
+# write:packages in git's credential helper (git credential fill).
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+SCRIPTS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 IMAGE_REPO=${IMAGE_REPO:-ghcr.io/ivbor-24/clips-pipeline}
 GH_REPO=${GH_REPO:-ivbor-24/clips-pipeline}
@@ -30,17 +34,20 @@ BUILD_NETWORK=${BUILD_NETWORK:-default}
 BUILD_JOBS=${BUILD_JOBS:-}
 BACKENDS="openvino cpu cuda"
 PUSH=false
+CHECKOUT="$SCRIPTS/.."
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --push) PUSH=true ;;
         --backends) BACKENDS=${2:?} && shift ;;
+        --checkout) CHECKOUT=${2:?} && shift ;;
         *)
-            sed -n '8,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+            sed -n '8,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
             exit 2 ;;
     esac
     shift
 done
+cd "$CHECKOUT"
 
 die() {
     echo "ERROR: $*" >&2
@@ -66,49 +73,66 @@ LABELS=(
     --label "org.opencontainers.image.licenses=MIT"
 )
 echo "Release $TAG ($SHA), backends: $BACKENDS, push: $PUSH"
+rm -rf "$OUT"
+mkdir -p "$OUT"
 
-# ---- Build ---------------------------------------------------------------------
+if [[ "$PUSH" == true ]]; then
+    TOKEN=$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill 2>/dev/null |
+        sed -n 's/^password=//p')
+    [[ -n "$TOKEN" ]] || die "No GitHub token in git's credential helper."
+    REGISTRY=${IMAGE_REPO%%/*}
+    # Logged in only while publishing: the token must not stay in
+    # ~/.docker/config.json.
+    trap 'docker logout "$REGISTRY" >/dev/null 2>&1 || true' EXIT
+    echo "$TOKEN" | docker login "$REGISTRY" -u "${GH_REPO%%/*}" --password-stdin >/dev/null
+fi
 
-IMAGES=()
-for backend in $BACKENDS; do
-    step "Build $IMAGE_REPO:$VERSION-$backend"
-    docker build --network "$BUILD_NETWORK" -f Dockerfile.backend \
-        --build-arg GPU_BACKEND="$backend" --build-arg CPU_TARGET=portable \
-        --build-arg BUILD_JOBS="$BUILD_JOBS" "${LABELS[@]}" \
-        -t "$IMAGE_REPO:$VERSION-$backend" .
-    IMAGES+=("$IMAGE_REPO:$VERSION-$backend")
-done
-step "Build $WEB_REPO:$VERSION"
+# ---- One image at a time: build, check, list its packages, push, remove ------
+
+PUBLISHED=()
+# finish IMAGE MOVING_TAG: list the packages of a checked image; with --push,
+# publish it under both tags and remove it here.
+finish() {
+    local image=$1 moving=$2
+    BUILD_NETWORK=$BUILD_NETWORK "$SCRIPTS/image_sources.sh" list "$OUT" "$image"
+    PUBLISHED+=("$image")
+    [[ "$PUSH" == true ]] || return 0
+    docker tag "$image" "$moving"
+    docker push "$image"
+    docker push "$moving"
+    docker image rm "$image" "$moving" >/dev/null
+}
+
+step "Web UI: $WEB_REPO:$VERSION"
 docker build --network "$BUILD_NETWORK" -f Dockerfile.frontend "${LABELS[@]}" \
     -t "$WEB_REPO:$VERSION" .
-IMAGES+=("$WEB_REPO:$VERSION")
+docker run --rm --entrypoint nginx "$WEB_REPO:$VERSION" -t
+finish "$WEB_REPO:$VERSION" "$WEB_REPO:latest"
 
-# ---- Check ---------------------------------------------------------------------
-
-step "Check the images"
 for backend in $BACKENDS; do
     image=$IMAGE_REPO:$VERSION-$backend
+    step "Backend $backend: $image"
+    docker build --network "$BUILD_NETWORK" -f Dockerfile.backend \
+        --build-arg GPU_BACKEND="$backend" --build-arg CPU_TARGET=portable \
+        --build-arg BUILD_JOBS="$BUILD_JOBS" "${LABELS[@]}" -t "$image" .
     docker run --rm --entrypoint python "$image" -c \
         "import llama_cpp, src; assert src.__version__ == '$VERSION', src.__version__"
     case "$backend" in
         openvino) docker run --rm --entrypoint sh "$image" -c "command -v whisper-cli >/dev/null" ;;
         cuda) docker run --rm --entrypoint python "$image" scripts/check_gpu.py --backend cuda --libraries-only ;;
     esac
-    echo "$image: OK"
+    finish "$image" "$IMAGE_REPO:$backend"
 done
-docker run --rm --entrypoint nginx "$WEB_REPO:$VERSION" -t
-echo "$WEB_REPO:$VERSION: OK"
 
 # ---- Sources of the copyleft packages -----------------------------------------
 
 step "Source code of the copyleft packages"
-rm -rf "$OUT"
-BUILD_NETWORK=$BUILD_NETWORK scripts/image_sources.sh "$OUT" "${IMAGES[@]}"
+BUILD_NETWORK=$BUILD_NETWORK "$SCRIPTS/image_sources.sh" fetch "$OUT"
 cat >"$OUT/README.txt" <<EOF
 Source code of the copyleft (GPL, LGPL, AGPL) Debian packages in the Docker
 images of Clips Pipeline $VERSION:
 
-$(printf '  %s\n' "${IMAGES[@]}")
+$(printf '  %s\n' "${PUBLISHED[@]}")
 
 packages-*.txt  every Debian package of each image (package, version, source
                 package, source version, "copyleft" where its copyright file
@@ -130,26 +154,7 @@ if [[ "$PUSH" != true ]]; then
     exit 0
 fi
 
-# ---- Publish -------------------------------------------------------------------
-
-TOKEN=$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill 2>/dev/null |
-    sed -n 's/^password=//p')
-[[ -n "$TOKEN" ]] || die "No GitHub token in git's credential helper."
-OWNER=${GH_REPO%%/*}
-REGISTRY=${IMAGE_REPO%%/*}
-step "Push to $REGISTRY"
-# Logged in only while pushing: the token must not stay in ~/.docker/config.json.
-trap 'docker logout "$REGISTRY" >/dev/null 2>&1 || true' EXIT
-echo "$TOKEN" | docker login "$REGISTRY" -u "$OWNER" --password-stdin >/dev/null
-for backend in $BACKENDS; do
-    docker tag "$IMAGE_REPO:$VERSION-$backend" "$IMAGE_REPO:$backend"
-    docker push "$IMAGE_REPO:$VERSION-$backend"
-    docker push "$IMAGE_REPO:$backend"
-done
-docker tag "$WEB_REPO:$VERSION" "$WEB_REPO:latest"
-docker push "$WEB_REPO:$VERSION"
-docker push "$WEB_REPO:latest"
-docker logout "$REGISTRY" >/dev/null
+# ---- The release ----------------------------------------------------------------
 
 step "Upload the sources to the release $TAG"
 api() { curl -fsS -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" "$@"; }
@@ -166,9 +171,7 @@ api -X POST -H "Content-Type: application/x-tar" --data-binary "@$ARCHIVE" \
     "https://uploads.github.com/repos/$GH_REPO/releases/$RELEASE_ID/assets?name=$NAME" >/dev/null
 echo "Uploaded $NAME"
 
-step "Move the release branch to $TAG"
-git push origin "$SHA:refs/heads/release"
-
 echo -e "\nPublished $TAG:"
-printf '  %s\n' "${IMAGES[@]}"
-echo "  sources: $NAME on https://github.com/$GH_REPO/releases/tag/$TAG"
+printf '  %s\n' "${PUBLISHED[@]}"
+echo "  sources: $NAME on the release $TAG"
+echo "Next: publish the release, then move the release branch: git push origin $TAG^{commit}:refs/heads/release"

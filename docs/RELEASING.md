@@ -14,23 +14,33 @@
    ```bash
    git clone https://github.com/ivbor-24/clips-pipeline.git release-build && cd release-build
    git checkout vX.Y.Z
-   just publish-images            # собрать, проверить, собрать исходники — без публикации
+   just publish-images            # собрать и проверить всё, собрать исходники — без публикации
    just publish-images --push     # то же и опубликовать
    ```
 
-   Скрипт `scripts/publish_images.sh`:
-   - собирает `ghcr.io/ivbor-24/clips-pipeline:X.Y.Z-openvino`, `-cpu`, `-cuda` и
-     `ghcr.io/ivbor-24/clips-pipeline-web:X.Y.Z` с метками версии и коммита;
-   - проверяет их (версия в образе, `whisper-cli`, библиотеки CUDA, конфигурация nginx);
-   - собирает исходники всех copyleft-пакетов образов (`scripts/image_sources.sh`, ~1,2 ГБ) в
-     `dist/release-X.Y.Z/clips-pipeline-X.Y.Z-sources.tar`;
-   - с `--push`: публикует образы и подвижные теги (`:openvino`, `:cpu`, `:cuda`, веб —
-     `:latest`), прикладывает архив исходников к Release и переводит ветку `release` на тег.
+   Скрипт `scripts/publish_images.sh` обрабатывает образы **по одному**: веб-интерфейс,
+   `openvino`, `cpu`, `cuda`. Каждый собирается (`ghcr.io/ivbor-24/clips-pipeline:X.Y.Z-<бэкенд>`,
+   `ghcr.io/ivbor-24/clips-pipeline-web:X.Y.Z`, с метками версии и коммита), проверяется
+   (версия в образе, `whisper-cli`, библиотеки CUDA, конфигурация nginx), с него снимается
+   список пакетов; с `--push` он сразу публикуется вместе с подвижным тегом (`:openvino`, `:cpu`,
+   `:cuda`, веб — `:latest`) и удаляется с диска. Так на диске одновременно один образ: пик —
+   образ `cuda` (~8 ГБ) при распаковке, ~16 ГБ свободного места. Затем скачиваются исходники
+   всех copyleft-пакетов (`scripts/image_sources.sh`, ~1,2 ГБ), упаковываются в
+   `dist/release-X.Y.Z/clips-pipeline-X.Y.Z-sources.tar` и с `--push` прикладываются к
+   выпуску (черновику).
+
+   Скрипт из более новой версии можно запустить на старом теге: `--checkout DIR`.
 
    Нужен токен GitHub с `write:packages` в credential helper git'а: `docker login` идёт только
-   на время публикации, токен не остаётся в `~/.docker/config.json`.
-4. **Опубликовать черновик выпуска** — когда образы и архив исходников на месте. Если у сети Docker нет
+   на время публикации, токен не остаётся в `~/.docker/config.json`. Если у сети Docker нет
    интернета — `BUILD_NETWORK=host`; при нехватке памяти на сборку — `BUILD_JOBS=2`.
+4. **Опубликовать черновик выпуска** — когда образы и архив исходников на месте.
+5. **Перевести ветку `release`** на тег — с этого момента `setup.sh` у пользователей ветки
+   `release` скачивает новые образы:
+
+   ```bash
+   git push origin vX.Y.Z^{commit}:refs/heads/release
+   ```
 
 ## Переносимая сборка
 
