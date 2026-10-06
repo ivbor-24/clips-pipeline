@@ -6,8 +6,8 @@
 
 1. **PR с номером версии:** `src/__init__.py`, `pyproject.toml`, `web/package.json`,
    `uv.lock` (`uv lock`), `web/package-lock.json`, раздел в `CHANGELOG.md`. Слить в `main`.
-2. **GitHub Release** `vX.Y.Z` на этом коммите: текст из `CHANGELOG.md`, ограничения. Release
-   создаёт тег.
+2. **Тег и черновик GitHub Release** `vX.Y.Z` на этом коммите: текст из `CHANGELOG.md`,
+   ограничения. Черновик публике не виден — до публикации образов страница выпуска не пустая.
 3. **Образы** — на машине с Docker, в чистом клоне на теге (сборка CUDA под все карты идёт
    часами, поэтому не в GitHub Actions):
 
@@ -28,7 +28,8 @@
      `:latest`), прикладывает архив исходников к Release и переводит ветку `release` на тег.
 
    Нужен токен GitHub с `write:packages` в credential helper git'а: `docker login` идёт только
-   на время публикации, токен не остаётся в `~/.docker/config.json`. Если у сети Docker нет
+   на время публикации, токен не остаётся в `~/.docker/config.json`.
+4. **Опубликовать черновик выпуска** — когда образы и архив исходников на месте. Если у сети Docker нет
    интернета — `BUILD_NETWORK=host`; при нехватке памяти на сборку — `BUILD_JOBS=2`.
 
 ## Переносимая сборка
