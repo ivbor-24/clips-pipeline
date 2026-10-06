@@ -116,10 +116,15 @@ for backend in $BACKENDS; do
         --build-arg GPU_BACKEND="$backend" --build-arg CPU_TARGET=portable \
         --build-arg BUILD_JOBS="$BUILD_JOBS" "${LABELS[@]}" -t "$image" .
     docker run --rm --entrypoint python "$image" -c \
-        "import llama_cpp, src; assert src.__version__ == '$VERSION', src.__version__"
+        "import src; assert src.__version__ == '$VERSION', src.__version__"
     case "$backend" in
-        openvino) docker run --rm --entrypoint sh "$image" -c "command -v whisper-cli >/dev/null" ;;
+        # llama_cpp of the cuda image loads only where the NVIDIA driver is
+        # (libcuda.so.1); check_gpu.py checks its libraries without it.
         cuda) docker run --rm --entrypoint python "$image" scripts/check_gpu.py --backend cuda --libraries-only ;;
+        openvino)
+            docker run --rm --entrypoint python "$image" -c "import llama_cpp"
+            docker run --rm --entrypoint sh "$image" -c "command -v whisper-cli >/dev/null" ;;
+        *) docker run --rm --entrypoint python "$image" -c "import llama_cpp" ;;
     esac
     finish "$image" "$IMAGE_REPO:$backend"
 done

@@ -47,7 +47,8 @@ case "$args" in
         ref=$(echo "$*" | awk '{print $4}')
         sha=$(awk -v r="$ref" '$1 == r {print $2}' "$state/published" 2>/dev/null)
         [[ -n "$sha" ]] || { echo "ERROR: not found: $ref" >&2; exit 1; }
-        echo "{\"config\":{\"Labels\":{\"org.opencontainers.image.revision\":\"$sha\"}}}" ;;
+        # Indented like the real output ("key": "value").
+        printf '{\n  "config": {\n    "Labels": {\n      "org.opencontainers.image.revision": "%s"\n    }\n  }\n}\n' "$sha" ;;
     " pull "*ghcr.io*) [[ -z "${FAKE_PULL_FAIL:-}" ]] ;;
     " tag "*) ;;
     " image inspect "*) [[ -z "${FAKE_IMAGE_MISSING:-}" ]] ;;
