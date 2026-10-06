@@ -5,7 +5,7 @@
 
 [project]
 name = "scientific-clips-pipeline"
-version = "0.9.0"
+version = "0.9.1"
 description = "MVP pipeline for generating vertical scientific clips from lectures"
 license = "MIT"
 license-files = ["LICENSE"]
