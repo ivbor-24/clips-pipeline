@@ -43,7 +43,7 @@ case " $* " in
         exit "$missing" ;;
     *" run "*"dpkg-query"*) cat "$STATE/packages" ;;
     *" run "*) exit "${FAKE_RUN_RC:-0}" ;;
-    *" build "*|*" tag "*|*" push "*|*" logout "*) ;;
+    *" build "*|*" tag "*|*" push "*|*" logout "*|*" image rm "*) ;;
     *" login "*) cat >"$STATE/login-password" ;;
     *) echo "unexpected docker call: $*" >&2; exit 99 ;;
 esac
@@ -192,20 +192,30 @@ class TestBuild:
 
 
 class TestPush:
-    def test_pushes_uploads_and_moves_the_release_branch(self, env):
-        result = publish(env, "--push", "--backends", "openvino")
+    def test_pushes_one_image_at_a_time_and_uploads_the_sources(self, env):
+        result = publish(env, "--push", "--backends", "openvino cuda")
 
         assert result.returncode == 0, result.stdout + result.stderr
         calls = log(env).splitlines()
         login = next(i for i, c in enumerate(calls) if " login " in c)
         pushes = [c for c in calls if c.startswith("docker push ")]
         assert [c.split()[-1] for c in pushes] == [
-            "ghcr.io/ivbor-24/clips-pipeline:1.2.3-openvino",
-            "ghcr.io/ivbor-24/clips-pipeline:openvino",
             "ghcr.io/ivbor-24/clips-pipeline-web:1.2.3",
             "ghcr.io/ivbor-24/clips-pipeline-web:latest",
+            "ghcr.io/ivbor-24/clips-pipeline:1.2.3-openvino",
+            "ghcr.io/ivbor-24/clips-pipeline:openvino",
+            "ghcr.io/ivbor-24/clips-pipeline:1.2.3-cuda",
+            "ghcr.io/ivbor-24/clips-pipeline:cuda",
         ]
         assert login < calls.index(pushes[0])
+        # Each image leaves the disk before the next one is built.
+        removed = next(
+            i
+            for i, c in enumerate(calls)
+            if "image rm ghcr.io/ivbor-24/clips-pipeline:1.2.3-openvino" in c
+        )
+        cuda_build = next(i for i, c in enumerate(calls) if "GPU_BACKEND=cuda" in c)
+        assert calls.index(pushes[3]) < removed < cuda_build
         assert calls[-1].startswith("docker logout ghcr.io")
         # The token reaches docker on stdin, never on the command line.
         assert (env["state"] / "login-password").read_text().strip() == "tok-123"
@@ -214,8 +224,47 @@ class TestPush:
         curl = log(env, "curl.log")
         assert "releases/42/assets?name=clips-pipeline-1.2.3-sources.tar" in curl
         assert "-X DELETE" not in curl  # no asset of that name yet
-        sha = git(env["project"], "rev-parse", "HEAD")
-        assert git(env["origin"], "rev-parse", "release") == sha
+        # Moving the release branch is a separate step after the release is out.
+        assert (
+            subprocess.run(
+                ["git", "rev-parse", "--verify", "-q", "release"],
+                cwd=env["origin"],
+                capture_output=True,
+            ).returncode
+            != 0
+        )
+        assert "Next: publish the release" in result.stdout
+
+    def test_a_draft_release_is_found(self, env):
+        result = publish(env, "--push", "--backends", "cpu")
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "releases/42/assets?name=" in log(env, "curl.log")
+
+    def test_checkout_of_another_directory(self, env, tmp_path):
+        tools = tmp_path / "tools/scripts"
+        tools.mkdir(parents=True)
+        for name in ("publish_images.sh", "image_sources.sh"):
+            shutil.copy2(env["project"] / "scripts" / name, tools / name)
+
+        result = subprocess.run(
+            [
+                BASH,
+                str(tools / "publish_images.sh"),
+                "--backends",
+                "cpu",
+                "--checkout",
+                str(env["project"]),
+            ],
+            cwd=tmp_path,
+            env=env["vars"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (env["project"] / "dist/release-1.2.3/clips-pipeline-1.2.3-sources.tar").exists()
 
     def test_logs_out_when_a_push_fails(self, env):
         fake = (env["state"].parent / "bin/docker").read_text()
@@ -240,9 +289,9 @@ class TestPush:
 
 
 class TestImageSources:
-    def run(self, env, out, *images):
+    def run(self, env, *args):
         return subprocess.run(
-            [BASH, "scripts/image_sources.sh", str(out), *images],
+            [BASH, "scripts/image_sources.sh", *map(str, args)],
             cwd=env["project"],
             env=env["vars"],
             capture_output=True,
@@ -253,18 +302,21 @@ class TestImageSources:
     def test_lists_packages_and_downloads_the_copyleft_sources(self, env, tmp_path):
         out = tmp_path / "out"
 
-        result = self.run(env, out, "repo/backend:1", "repo/web:1")
+        listed = self.run(env, "list", out, "repo/backend:1")
+        listed_too = self.run(env, "list", out, "repo/web:1")
+        result = self.run(env, "fetch", out)
 
-        assert result.returncode == 0, result.stderr
+        assert listed.returncode == listed_too.returncode == result.returncode == 0, result.stderr
         assert (out / "packages-repo_backend_1.txt").read_text() == PACKAGES
         assert (out / "sources.txt").read_text() == "ffmpeg=7:7.1.2-1\nglibc=2.41-12\n"
         assert sorted(p.name for p in (out / "sources").iterdir()) == ["ffmpeg.dsc", "glibc.dsc"]
-        assert "repo/backend:1: 4 packages, 3 copyleft" in result.stdout
+        assert "repo/backend:1: 4 packages, 3 copyleft" in listed.stdout
 
     def test_a_missing_source_package_fails(self, env, tmp_path):
         write(env["state"] / "missing", "glibc=2.41-12\n")
 
-        result = self.run(env, tmp_path / "out", "repo/backend:1")
+        self.run(env, "list", tmp_path / "out", "repo/backend:1")
+        result = self.run(env, "fetch", tmp_path / "out")
 
         assert result.returncode == 1
         assert "MISSING glibc=2.41-12" in result.stderr
