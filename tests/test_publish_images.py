@@ -168,6 +168,8 @@ class TestBuild:
         assert f"org.opencontainers.image.revision={sha}" in calls
         assert "org.opencontainers.image.version=1.2.3" in calls
         assert "check_gpu.py --backend cuda --libraries-only" in calls
+        # Without the NVIDIA driver llama_cpp of the cuda image does not load.
+        assert calls.count("import llama_cpp") == 1  # openvino only
         assert "login" not in calls and "push" not in calls
 
         out = env["project"] / "dist/release-1.2.3"

@@ -442,9 +442,10 @@ check_disk() {
 # org.opencontainers.image.revision label), read from the registry without
 # downloading the image; empty when there is no such image.
 image_revision() {
+    # The JSON is indented: "key": "value", with a space after the colon.
     docker buildx imagetools inspect "$1" --format '{{json .Image}}' 2>/dev/null |
-        grep -o '"org.opencontainers.image.revision":"[0-9a-f]*"' | head -n 1 |
-        cut -d'"' -f4 || true
+        grep -o '"org.opencontainers.image.revision": *"[0-9a-f]*"' | head -n 1 |
+        sed 's/.*"\([0-9a-f]*\)"$/\1/' || true
 }
 
 # find_published_images: the published images fit when this checkout is a

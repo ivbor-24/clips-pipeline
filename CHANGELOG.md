@@ -4,7 +4,7 @@
 [Keep a Changelog](https://keepachangelog.com/), версии — по
 [Semantic Versioning](https://semver.org/).
 
-## [0.9.1] — 2026-10-05 — готовые образы
+## [0.9.2] — 2026-10-06 — готовые образы
 
 ### Добавлено
 
