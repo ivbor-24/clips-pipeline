@@ -126,7 +126,8 @@ class TestBrollConfig:
         config = BrollConfig()
         assert config.enabled is False
         assert config.max_suggestions is None
-        assert config.prompt_file == "config/prompts/broll_suggestions_v1.txt"
+        assert config.prompt_file == "config/prompts/broll_suggestions_v2.txt"
+        assert config.max_block_chars is None
 
     def test_custom_values(self):
         from src.config import BrollConfig
@@ -329,6 +330,27 @@ class TestBuildBrollPrompt:
         assert "at most" not in prompt
 
 
+class TestBuildBrollPromptLanguage:
+    """Test that the prompt names the transcript language."""
+
+    def test_known_language_is_named(self):
+        from src.broll import _build_broll_prompt
+        from src.config import BrollConfig
+
+        prompt = _build_broll_prompt(
+            [{"start": 0, "text": "привет", "language": "ru"}], BrollConfig()
+        )
+        assert "must be in Russian" in prompt
+        assert "{{" not in prompt
+
+    def test_unknown_language_falls_back_to_transcript(self):
+        from src.broll import _build_broll_prompt
+        from src.config import BrollConfig
+
+        prompt = _build_broll_prompt([{"start": 0, "text": "hello"}], BrollConfig())
+        assert "must be in the language of the transcript" in prompt
+
+
 class TestBrollPipelineIntegration:
     """Test b-roll stage integration into the draft (chapters) pipeline."""
 
@@ -477,11 +499,151 @@ class TestPromptFile:
     """Test b-roll suggestions prompt file."""
 
     def test_prompt_file_exists(self):
-        prompt_path = Path("config/prompts/broll_suggestions_v1.txt")
-        assert prompt_path.exists()
+        from src.config import BrollConfig
+
+        assert Path(BrollConfig().prompt_file).exists()
 
     def test_prompt_has_placeholders(self):
-        prompt_path = Path("config/prompts/broll_suggestions_v1.txt")
-        content = prompt_path.read_text()
+        from src.config import BrollConfig
+
+        content = Path(BrollConfig().prompt_file).read_text()
+        assert "{{EXCERPT_NOTE}}" in content
         assert "{{COUNT_INSTRUCTION}}" in content
         assert "{{TRANSCRIPT}}" in content
+
+
+def _segments(count: int, step: float = 30.0, text: str = "x" * 91):
+    """Transcript of `count` segments, `step` seconds apart, 100 chars each with the label."""
+    return [{"start": i * step, "end": (i + 1) * step, "text": text} for i in range(count)]
+
+
+class TestNormalizeBlockSuggestions:
+    """Test cleanup of the LLM suggestions of one block."""
+
+    def test_uses_timestamp_and_snaps_to_segment(self):
+        from src.broll import _normalize_block_suggestions
+
+        block = _segments(10)[4:]  # 120 s .. 300 s
+        raw = [
+            {"timestamp": "03:07", "start_sec": 999, "suggestion": " Map ", "keywords": ["map", 1]},
+            {"start_sec": 262.0, "suggestion": "Chart", "keywords": "chart"},
+            {"timestamp": "04:00", "suggestion": ""},
+            {"timestamp": "later", "suggestion": "No time"},
+            "junk",
+        ]
+        assert _normalize_block_suggestions(raw, block) == [
+            {"start_sec": 180.0, "suggestion": "Map", "keywords": ["map", "1"]},
+            {"start_sec": 270.0, "suggestion": "Chart", "keywords": []},
+        ]
+
+
+class TestGenerateBrollLlm:
+    """Test block-wise b-roll suggestion generation."""
+
+    def test_single_request_when_transcript_fits(self):
+        from src.broll import _generate_broll_llm
+        from src.config import BrollConfig
+
+        adapter = MagicMock()
+        adapter.analyze_segments.return_value = [{"timestamp": "01:00", "suggestion": "A"}]
+        result = _generate_broll_llm(adapter, _segments(20), BrollConfig(max_suggestions=5), None)
+        assert adapter.analyze_segments.call_count == 1
+        prompt = adapter.analyze_segments.call_args.kwargs["prompt"]
+        assert "Suggest at most 5 moments, spread across the whole video" in prompt
+        assert "excerpt" not in prompt
+        assert result == [{"start_sec": 60.0, "suggestion": "A", "keywords": []}]
+
+    def test_blocks_cover_transcript_and_cap_is_shared(self):
+        from src.broll import _generate_broll_llm
+        from src.config import BrollConfig
+
+        adapter = MagicMock()
+        adapter.analyze_segments.side_effect = lambda block, prompt: [
+            {"start_sec": seg["start"], "suggestion": f"s{int(seg['start'])}"} for seg in block[:4]
+        ]
+        result = _generate_broll_llm(adapter, _segments(30), BrollConfig(max_suggestions=6), 1000)
+
+        calls = adapter.analyze_segments.call_args_list
+        assert [c.args[0][0]["start"] for c in calls] == [0.0, 300.0, 600.0]
+        assert all("Suggest at most 2 moments in this excerpt" in c.kwargs["prompt"] for c in calls)
+        assert len(result) == 6
+        starts = [s["start_sec"] for s in result]
+        assert starts == sorted(starts)
+        assert starts[0] < 300 <= starts[2] and starts[-1] >= 600
+
+    def test_unset_cap_limits_each_block_by_its_length(self):
+        from src.broll import _generate_broll_llm
+        from src.config import BrollConfig
+
+        adapter = MagicMock()
+        adapter.analyze_segments.return_value = []
+        _generate_broll_llm(adapter, _segments(30), BrollConfig(), 1000)
+        prompt = adapter.analyze_segments.call_args_list[0].kwargs["prompt"]
+        assert "Suggest at most 5 moments in this excerpt" in prompt
+
+    def test_failed_block_is_skipped(self):
+        from src.broll import _generate_broll_llm
+        from src.config import BrollConfig
+        from src.llm_adapter import LLMAdapterError
+
+        adapter = MagicMock()
+        adapter.analyze_segments.side_effect = [
+            [{"timestamp": "00:30", "suggestion": "A"}],
+            LLMAdapterError("bad json"),
+            [{"timestamp": "10:30", "suggestion": "C"}],
+        ]
+        result = _generate_broll_llm(adapter, _segments(30), BrollConfig(), 1000)
+        assert [s["suggestion"] for s in result] == ["A", "C"]
+
+    def test_most_blocks_failing_raises(self):
+        from src.broll import BrollError, _generate_broll_llm
+        from src.config import BrollConfig
+        from src.llm_adapter import LLMAdapterError
+
+        adapter = MagicMock()
+        adapter.analyze_segments.side_effect = [LLMAdapterError("x"), LLMAdapterError("x"), []]
+        with pytest.raises(BrollError):
+            _generate_broll_llm(adapter, _segments(30), BrollConfig(), 1000)
+
+    def test_unavailable_model_is_not_retried(self):
+        from src.broll import _generate_broll_llm
+        from src.config import BrollConfig
+        from src.llm_adapter import LLMUnavailableError
+
+        adapter = MagicMock()
+        adapter.analyze_segments.side_effect = LLMUnavailableError("no model")
+        with pytest.raises(LLMUnavailableError):
+            _generate_broll_llm(adapter, _segments(30), BrollConfig(), 1000)
+        assert adapter.analyze_segments.call_count == 1
+
+
+class TestGenerateBrollWithLlm:
+    """Test that generate_broll_suggestions hands the full local-model config to the adapter."""
+
+    def test_llm_config_keeps_local_model_settings(self, tmp_path):
+        from src.broll import generate_broll_suggestions
+        from src.config import Config
+
+        config = Config.load("config/config.yaml")
+        config.work_dir = tmp_path
+        artifacts = tmp_path / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "transcript.json").write_text(json.dumps(_segments(260)))
+        (artifacts / "meta.json").write_text(json.dumps({"duration_sec": 7800, "source": "v.mp4"}))
+
+        adapter = MagicMock()
+        adapter.analyze_segments.side_effect = lambda block, prompt: [
+            {"start_sec": block[0]["start"], "suggestion": "Map", "keywords": ["map"]}
+        ]
+        with patch("src.llm_adapter.create_llm_adapter", return_value=adapter) as create:
+            suggestions = generate_broll_suggestions(config)
+
+        llm_config = create.call_args.args[0]
+        assert llm_config.model_path == config.scoring.llm.model_path
+        assert llm_config.n_ctx == config.scoring.llm.n_ctx
+        assert llm_config.prompt_file == config.broll.prompt_file
+        assert adapter.analyze_segments.call_count > 1
+        adapter.unload.assert_called_once()
+        assert suggestions[0]["timestamp"] == "0:00:00"
+        assert suggestions[-1]["timestamp"].startswith("2:")
+        assert (artifacts / "broll_suggestions.txt").read_text().startswith("0:00:00 Map [map]")

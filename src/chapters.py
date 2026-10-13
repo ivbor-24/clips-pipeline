@@ -13,6 +13,8 @@ Outputs:
 """
 
 import json
+import math
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -22,6 +24,14 @@ from src.config import ChaptersConfig, Config, LLMConfig
 from src.notices import add_notice, clear_notices
 
 logger = structlog.get_logger("chapters")
+
+# Conservative chars-per-token for sizing transcript blocks: Cyrillic text plus
+# the digit-heavy [MM:SS] labels tokenize to roughly 2-3 chars per token.
+_CHARS_PER_TOKEN = 2.0
+# Context reserved for the prompt template, system message and chat markup.
+_PROMPT_OVERHEAD_TOKENS = 600
+# Context reserved for the JSON answer of one block (a handful of chapters).
+_RESPONSE_RESERVE_TOKENS = 1500
 
 
 class ChaptersError(Exception):
@@ -43,6 +53,42 @@ def format_timestamp_mmss(seconds: float) -> str:
     minutes = int(seconds // 60)
     secs = int(seconds % 60)
     return f"{minutes:02d}:{secs:02d}"
+
+
+def format_timestamp(seconds: float, with_hours: bool = False) -> str:
+    """
+    Convert seconds to a chapter timestamp.
+
+    Args:
+        seconds: Time in seconds
+        with_hours: Use H:MM:SS (required by YouTube/VK for videos of an hour or more)
+
+    Returns:
+        MM:SS or H:MM:SS formatted timestamp string
+    """
+    if not with_hours:
+        return format_timestamp_mmss(seconds)
+    total = int(seconds)
+    return f"{total // 3600}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
+def parse_timestamp(value: Any) -> Optional[float]:
+    """
+    Parse "MM:SS" or "H:MM:SS" (minutes may exceed 59) into seconds.
+
+    Args:
+        value: Timestamp string from the LLM response
+
+    Returns:
+        Seconds, or None if the value is not a timestamp
+    """
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"\s*\[?(?:(\d+):)?(\d+):(\d{1,2})\]?\s*", value)
+    if not match:
+        return None
+    hours, minutes, secs = match.groups()
+    return int(hours or 0) * 3600 + int(minutes) * 60 + int(secs)
 
 
 def format_chapters_youtube(chapters: List[Dict[str, Any]]) -> str:
@@ -99,13 +145,19 @@ def validate_chapters(chapters: List[Dict[str, Any]], duration_sec: float) -> bo
     return True
 
 
-def _build_chapters_prompt(transcript: List[Dict[str, Any]], config: ChaptersConfig) -> str:
+def _build_chapters_prompt(
+    transcript: List[Dict[str, Any]],
+    config: ChaptersConfig,
+    is_excerpt: bool = False,
+) -> str:
     """
     Build the chapters detection prompt with transcript data.
 
     Args:
-        transcript: List of transcript segments
+        transcript: List of transcript segments (the whole video or one block)
         config: Chapters configuration
+        is_excerpt: True when the segments are a block of a longer video that
+            continues after it
 
     Returns:
         Formatted prompt string
@@ -121,6 +173,16 @@ def _build_chapters_prompt(transcript: List[Dict[str, Any]], config: ChaptersCon
         for seg in transcript
     )
 
+    first_timestamp = (
+        format_timestamp_mmss(transcript[0].get("start", 0)) if transcript else "00:00"
+    )
+    excerpt_note = (
+        "The transcript below is an excerpt of a longer video and may stop mid-topic. "
+        "Only mark breaks you can see in the excerpt."
+        if is_excerpt
+        else ""
+    )
+
     if config.target_count:
         count_instruction = (
             f"Create exactly {config.target_count} chapters, "
@@ -130,13 +192,179 @@ def _build_chapters_prompt(transcript: List[Dict[str, Any]], config: ChaptersCon
         count_instruction = (
             f"Each chapter should be {config.min_minutes} to {config.max_minutes} minutes long"
         )
+        # Local models follow an explicit count far better than a duration
+        span_min = (
+            (
+                transcript[-1].get("end", transcript[-1].get("start", 0))
+                - transcript[0].get("start", 0)
+            )
+            / 60
+            if transcript
+            else 0
+        )
+        if span_min >= config.min_minutes:
+            low = max(1, int(span_min // config.max_minutes))
+            high = max(low, math.ceil(span_min / config.min_minutes))
+            count_instruction += (
+                f". The transcript covers about {round(span_min)} minutes, "
+                f"so return {low} to {high} chapters, no more"
+            )
 
     prompt = template.replace("{{CHAPTER_COUNT_INSTRUCTION}}", count_instruction)
     prompt = prompt.replace("{{MIN_MINUTES}}", str(config.min_minutes))
     prompt = prompt.replace("{{MAX_MINUTES}}", str(config.max_minutes))
+    prompt = prompt.replace("{{FIRST_TIMESTAMP}}", first_timestamp)
+    prompt = prompt.replace("{{EXCERPT_NOTE}}", excerpt_note)
     prompt = prompt.replace("{{TRANSCRIPT}}", transcript_text)
 
     return prompt
+
+
+def resolve_block_max_chars(llm_config: LLMConfig, override: Optional[int] = None) -> Optional[int]:
+    """
+    Transcript characters that fit into one LLM request.
+
+    Args:
+        llm_config: LLM configuration (provider and context size)
+        override: Explicit budget from the module config (max_block_chars)
+
+    Returns:
+        Character budget per block, or None to send the transcript whole
+    """
+    if override is not None:
+        return override
+    if llm_config.provider != "llama_cpp":
+        return None
+    response_tokens = min(llm_config.max_tokens, _RESPONSE_RESERVE_TOKENS)
+    prompt_tokens = llm_config.n_ctx - response_tokens - _PROMPT_OVERHEAD_TOKENS
+    return max(1000, int(prompt_tokens * _CHARS_PER_TOKEN))
+
+
+def block_end(transcript: List[Dict[str, Any]], start_idx: int, max_chars: Optional[int]) -> int:
+    """Exclusive end index of the block starting at start_idx within the char budget."""
+    if max_chars is None:
+        return len(transcript)
+    used = 0
+    idx = start_idx
+    while idx < len(transcript):
+        # +9 for the "[MM:SS] " label and the newline
+        used += len(str(transcript[idx].get("text", "")).strip()) + 9
+        if used > max_chars and idx > start_idx:
+            break
+        idx += 1
+    return idx
+
+
+def _normalize_block_chapters(
+    raw: List[Dict[str, Any]], block: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Clean the LLM chapters of one block.
+
+    Start times are taken from the timestamp label (models miscompute
+    start_sec), snapped to a segment start so a break never lands mid-sentence,
+    and the first chapter is pinned to the block start.
+
+    Args:
+        raw: Chapter dicts as returned by the LLM
+        block: Transcript segments the chapters were detected in
+
+    Returns:
+        Chapter dicts with start_sec, title and summary, in ascending order
+    """
+    starts = [float(seg.get("start", 0)) for seg in block]
+    chapters: List[Dict[str, Any]] = []
+    for ch in raw:
+        if not isinstance(ch, dict) or not str(ch.get("title", "")).strip():
+            continue
+        start = parse_timestamp(ch.get("timestamp"))
+        if start is None:
+            try:
+                start = float(ch.get("start_sec"))
+            except (TypeError, ValueError):
+                continue
+        start = min(starts, key=lambda s: abs(s - start))
+        if not chapters:
+            start = starts[0]
+        elif start <= chapters[-1]["start_sec"]:
+            continue
+        chapters.append(
+            {
+                "start_sec": start,
+                "title": str(ch["title"]).strip(),
+                "summary": str(ch.get("summary", "")).strip(),
+            }
+        )
+    return chapters
+
+
+def _generate_chapters_llm(
+    adapter: Any,
+    transcript: List[Dict[str, Any]],
+    config: ChaptersConfig,
+    max_block_chars: Optional[int],
+) -> List[Dict[str, Any]]:
+    """
+    Detect chapters with the LLM, block by block when the transcript does not
+    fit into the context.
+
+    The last chapter of a non-final block may continue past the block, so the
+    next block starts from that chapter's beginning and detects it again.
+
+    Args:
+        adapter: LLM adapter
+        transcript: List of transcript segments
+        config: Chapters configuration
+        max_block_chars: Character budget per request; None sends everything at once
+
+    Returns:
+        List of chapter dicts with start_sec, title and summary
+
+    Raises:
+        ChaptersError: If the LLM returns no usable chapters for a block
+    """
+    chapters: List[Dict[str, Any]] = []
+    idx = 0
+    block_no = 0
+    while idx < len(transcript):
+        end = block_end(transcript, idx, max_block_chars)
+        block = transcript[idx:end]
+        is_last = end >= len(transcript)
+        block_no += 1
+
+        # An exact chapter count only makes sense for the transcript as a whole
+        block_config = (
+            config if idx == 0 and is_last else config.model_copy(update={"target_count": None})
+        )
+        prompt = _build_chapters_prompt(block, block_config, is_excerpt=not is_last)
+        response = adapter.analyze_segments(block, prompt=prompt)
+        raw = response if isinstance(response, list) else _parse_chapters_response(str(response))
+        block_chapters = _normalize_block_chapters(raw, block)
+        if not block_chapters:
+            raise ChaptersError(f"LLM returned no chapters for block {block_no}")
+
+        logger.info(
+            "chapters_block_done",
+            block=block_no,
+            block_start_sec=block[0].get("start", 0),
+            block_end_sec=block[-1].get("end", block[-1].get("start", 0)),
+            chapters=len(block_chapters),
+        )
+
+        next_idx = end
+        if not is_last and len(block_chapters) > 1:
+            carry_start = block_chapters[-1]["start_sec"]
+            carry_idx = next(
+                i for i in range(idx, end) if float(transcript[i].get("start", 0)) >= carry_start
+            )
+            if carry_idx > idx:
+                block_chapters = block_chapters[:-1]
+                next_idx = carry_idx
+
+        chapters.extend(block_chapters)
+        idx = next_idx
+
+    return chapters
 
 
 def _parse_chapters_response(response_text: str) -> List[Dict[str, Any]]:
@@ -251,25 +479,16 @@ def generate_chapters(config: Config, dry_run: bool = False) -> Optional[List[Di
         try:
             from src.llm_adapter import LLMAdapterError, create_llm_adapter
 
-            llm_config = LLMConfig(
-                enabled=True,
-                provider=config.scoring.llm.provider,
-                model=config.scoring.llm.model,
-                api_key=config.scoring.llm.api_key,
-                api_base=config.scoring.llm.api_base,
-                temperature=config.scoring.llm.temperature,
-                max_tokens=config.scoring.llm.max_tokens,
-                prompt_file=chapters_config.prompt_file,
+            # Copy the scoring LLM settings whole: the local llama.cpp model
+            # needs model_path/model_repo, n_ctx, seed and the rest of them.
+            llm_config = config.scoring.llm.model_copy(
+                update={"enabled": True, "prompt_file": chapters_config.prompt_file}
             )
+            max_block_chars = resolve_block_max_chars(llm_config, chapters_config.max_block_chars)
+            logger.info("chapters_llm_blocks", max_block_chars=max_block_chars)
 
             adapter = create_llm_adapter(llm_config, config.work_dir, "chapters")
-            prompt = _build_chapters_prompt(transcript, chapters_config)
-
-            response = adapter.analyze_segments(transcript, prompt=prompt)
-            if isinstance(response, list):
-                chapters = response
-            else:
-                chapters = _parse_chapters_response(str(response))
+            chapters = _generate_chapters_llm(adapter, transcript, chapters_config, max_block_chars)
 
         except (LLMAdapterError, ChaptersError) as e:
             add_notice(
@@ -287,6 +506,21 @@ def generate_chapters(config: Config, dry_run: bool = False) -> Optional[List[Di
     else:
         logger.info("LLM disabled, using fallback chapters generation")
         chapters = _generate_chapters_fallback(transcript, duration_sec, chapters_config)
+
+    with_hours = duration_sec >= 3600
+    for ch in chapters:
+        ch["start_sec"] = round(float(ch.get("start_sec", 0)), 2)
+    if chapters:
+        chapters[0]["start_sec"] = 0.0
+    chapters = [
+        {
+            "timestamp": format_timestamp(ch["start_sec"], with_hours),
+            "start_sec": ch["start_sec"],
+            "title": ch.get("title", "Untitled"),
+            "summary": ch.get("summary", ""),
+        }
+        for ch in chapters
+    ]
 
     if not validate_chapters(chapters, duration_sec):
         logger.warning("Chapters validation failed, adjusting")
