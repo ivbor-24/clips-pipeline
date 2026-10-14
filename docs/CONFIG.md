@@ -113,13 +113,15 @@ chapters:
   min_minutes: 5
   max_minutes: 7
   target_count: null
-  prompt_file: "config/prompts/chapter_detection_v1.txt"
+  prompt_file: "config/prompts/chapter_detection_v2.txt"
   output_format: "both"
+  max_block_chars: null  # символов транскрипта на один запрос к LLM; null = по n_ctx (llama_cpp) или весь транскрипт (API)
 
 broll:
   enabled: false
   max_suggestions: null
-  prompt_file: "config/prompts/broll_suggestions_v1.txt"
+  prompt_file: "config/prompts/broll_suggestions_v2.txt"
+  max_block_chars: null  # как в chapters
 
 cleanup:
   retention_days: 30

@@ -110,14 +110,16 @@ chapters:
   min_minutes: 5
   max_minutes: 7
   target_count: null  # exact chapter count; null = model decides (guided by min/max_minutes)
-  prompt_file: "config/prompts/chapter_detection_v1.txt"
+  prompt_file: "config/prompts/chapter_detection_v2.txt"
   output_format: "both"  # json | youtube | both
+  max_block_chars: null  # transcript chars per LLM request; null = sized from n_ctx (llama_cpp) or whole transcript (API)
 
 # B-roll suggestions settings (advisory artifact, generated during chapters/draft mode)
 broll:
   enabled: false
   max_suggestions: null  # cap on suggestions; null = model decides
-  prompt_file: "config/prompts/broll_suggestions_v1.txt"
+  prompt_file: "config/prompts/broll_suggestions_v2.txt"
+  max_block_chars: null  # transcript chars per LLM request; null = sized from n_ctx (llama_cpp) or whole transcript (API)
 
 # Cleanup settings
 cleanup:

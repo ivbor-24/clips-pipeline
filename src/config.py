@@ -206,14 +206,20 @@ class ChaptersConfig(BaseModel):
     target_count: Optional[int] = (
         None  # exact chapter count; None = model's discretion (uses min/max_minutes as a guide)
     )
-    prompt_file: str = "config/prompts/chapter_detection_v1.txt"
+    prompt_file: str = "config/prompts/chapter_detection_v2.txt"
     output_format: Literal["json", "youtube", "both"] = "both"
+    # Transcript chars per LLM request; None = sized from n_ctx for llama_cpp,
+    # the whole transcript at once for API models
+    max_block_chars: Optional[int] = Field(default=None, ge=1000)
 
 
 class BrollConfig(BaseModel):
     enabled: bool = False
     max_suggestions: Optional[int] = None  # cap on suggestions; None = model's discretion
-    prompt_file: str = "config/prompts/broll_suggestions_v1.txt"
+    prompt_file: str = "config/prompts/broll_suggestions_v2.txt"
+    # Transcript chars per LLM request; None = sized from n_ctx for llama_cpp,
+    # the whole transcript at once for API models
+    max_block_chars: Optional[int] = Field(default=None, ge=1000)
 
 
 class CleanupConfig(BaseModel):
