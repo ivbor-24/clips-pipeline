@@ -3,6 +3,7 @@ Tests for TASK-06: Rendering & Export Module
 """
 
 import json
+import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -216,9 +217,8 @@ class TestBuildCropFilter:
 
         crop_params = {"frames": [], "segments": [], "fallback": "center_crop"}
 
-        filter_str, label = build_crop_filter(crop_params, 1920, 1080, 1080, 1920)
+        filter_str = build_crop_filter(crop_params, 1920, 1080, 1080, 1920)
 
-        assert label is None
         assert filter_str.startswith("crop=")
         # 1080 * 9/16 = 607.5 -> 608 wide strip, full height
         assert filter_str.startswith("crop=608:1080:")
@@ -239,7 +239,7 @@ class TestBuildCropFilter:
             "fallback": "none",
         }
 
-        filter_str, label = build_crop_filter(crop_params, 1920, 1080, 1080, 1920)
+        filter_str = build_crop_filter(crop_params, 1920, 1080, 1080, 1920)
 
         # strip width 608, max x = 1920-608 = 1312
         assert filter_str.startswith("crop=608:1080:1312:0,")
@@ -250,12 +250,12 @@ class TestBuildCropFilter:
 
         crop_params = {"frames": [], "segments": [], "fallback": "none"}
 
-        filter_str, _ = build_crop_filter(crop_params, 1920, 1080, 1080, 1920)
+        filter_str = build_crop_filter(crop_params, 1920, 1080, 1080, 1920)
 
         assert "1080:1920" in filter_str
 
-    def test_multi_segment_graph_with_concat(self):
-        """Multiple tracking segments produce trim/concat filtergraph."""
+    def test_segments_switch_the_window_on_their_start(self):
+        """One crop filter whose window switches at the next segment's start (clip time)."""
         from src.rendering import build_crop_filter
 
         crop_params = {
@@ -267,13 +267,23 @@ class TestBuildCropFilter:
             "fallback": "none",
         }
 
-        filter_str, label = build_crop_filter(crop_params, 1920, 1080, 1080, 1920, clip_start=10.0)
+        filter_str = build_crop_filter(crop_params, 1920, 1080, 1080, 1920, clip_start=10.0)
 
-        assert label == "vout"
-        assert "trim=start=0.0:end=20.0" in filter_str
-        assert "trim=start=20.0:end=40.0" in filter_str
-        assert "[v0]" in filter_str and "[v1]" in filter_str
-        assert "concat=n=2:v=1:a=0[vout]" in filter_str
+        # x = cx - 304: 196, then 1196 from t = 20 s (a frame within 5 ms counts)
+        assert filter_str == (
+            "crop=w=608:h=1080:x='196+1000*gte(t,19.995)':y='0':exact=1,scale=1080:1920,setsar=1"
+        )
+
+    def test_path_pans_the_window(self):
+        from src.rendering import build_crop_filter
+
+        segment = {"start": 10.0, "end": 30.0, "cx": 800.0, "cy": 400.0, "has_face": True}
+        segment["path"] = [[10.0, 800.0], [14.0, 800.0], [16.5, 1050.0], [30.0, 1300.0]]
+
+        filter_str = build_crop_filter({"segments": [segment]}, 1920, 1080, 1080, 1920, 10.0)
+
+        x = filter_str.split("x='")[1].split("'")[0]
+        assert x == "496+250*clip((t-4.000)/2.500,0,1)+250*clip((t-6.500)/13.500,0,1)"
 
     def test_segments_without_face_use_center(self):
         """No-face segments fall back to centered strip."""
@@ -288,10 +298,42 @@ class TestBuildCropFilter:
             "fallback": "center_crop",
         }
 
-        filter_str, label = build_crop_filter(crop_params, 1920, 1080, 1080, 1920)
+        filter_str = build_crop_filter(crop_params, 1920, 1080, 1080, 1920)
 
-        assert label == "vout"
-        assert "crop=608:1080:656:0" in filter_str
+        assert filter_str.startswith("crop=w=608:h=1080:x='656':y='0':exact=1,")
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+    def test_window_position_on_every_frame(self):
+        """ffmpeg moves the window as planned: still, a pan, a switch on the cut frame."""
+        import subprocess
+
+        from src.rendering import build_crop_filter
+
+        # Each column of the 640x320 source holds its own x: red = x % 256, green = x // 256.
+        source = "color=s=640x320:r=25:d=4,format=rgb24,geq=r='mod(X,256)':g='floor(X/256)':b=0"
+        segments = [
+            # strip 180 wide: x = cx - 90; pans 100 -> 300 between 1 and 2 s
+            {"start": 0.0, "end": 2.0, "cx": 200.0, "cy": 160.0, "has_face": True},
+            {"start": 2.0, "end": 4.0, "cx": 500.0, "cy": 160.0, "has_face": True},
+        ]
+        segments[0]["path"] = [[0.0, 100.0], [1.0, 100.0], [2.0, 300.0]]
+        chain = build_crop_filter({"segments": segments}, 640, 320, 180, 320)
+        result = subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", source, "-vf", chain]
+            + ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+            check=True,
+            capture_output=True,
+        )
+        frame_size = 180 * 320 * 3
+        frames = [
+            result.stdout[i : i + frame_size] for i in range(0, len(result.stdout), frame_size)
+        ]
+
+        positions = [frame[0] + 256 * frame[1] for frame in frames]  # x of the left column
+        expected = [10 if n < 25 else 10 + 200 * min(n - 25, 25) / 25 for n in range(50)]
+        expected += [410] * 50
+        assert len(positions) == 100
+        assert all(abs(x - e) <= 1 for x, e in zip(positions, expected)), positions
 
 
 class TestBuildAudioLoudnormFilter:
@@ -654,33 +696,28 @@ class TestRenderClipCommand:
         assert vf.split(",")[-1].startswith("subtitles=")
         assert "-af" in cmd
 
-    def test_multi_segment_graph_maps_vout_and_aout(self, tmp_path):
+    def test_moving_window_uses_vf_with_subtitles_last(self, tmp_path):
         segments = [
             {"start": 100.0, "end": 130.0, "cx": 1300.0, "cy": 400.0, "has_face": True},
             {"start": 130.0, "end": 160.0, "cx": 800.0, "cy": 300.0, "has_face": True},
         ]
         cmd = self._render(tmp_path, segments)
 
-        graph = cmd[cmd.index("-filter_complex") + 1]
-        # clip-relative trims (input seek resets the timeline to 0)
-        assert "trim=start=0.0:end=30.0" in graph
-        assert "trim=start=30.0:end=60.0" in graph
-        assert "concat=n=2:v=1:a=0" in graph
-        # subtitles are burned once, after concat
-        assert graph.count("subtitles=") == 1
-        assert graph.index("concat=") < graph.index("subtitles=")
-        assert "[0:a]loudnorm" in graph and "[aout]" in graph
-        maps = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-map"]
-        assert maps == ["[vout]", "[aout]"]
-        assert "-vf" not in cmd and "-af" not in cmd
+        assert "-filter_complex" not in cmd and "-map" not in cmd
+        vf = cmd[cmd.index("-vf") + 1]
+        # clip-relative times (input seek resets the timeline to 0)
+        assert vf.startswith("crop=w=608:h=1080:x='996-500*gte(t,29.995)':y='0':exact=1,")
+        assert "trim=" not in vf and "concat=" not in vf
+        assert vf.count("subtitles=") == 1 and vf.split(",")[-1].startswith("subtitles=")
+        assert cmd[cmd.index("-af") + 1].startswith("loudnorm")
 
-    def test_multi_segment_without_subtitles(self, tmp_path):
+    def test_moving_window_without_subtitles(self, tmp_path):
         segments = [
             {"start": 100.0, "end": 130.0, "cx": 1300.0, "cy": 400.0, "has_face": True},
             {"start": 130.0, "end": 160.0, "cx": None, "cy": None, "has_face": False},
         ]
         cmd = self._render(tmp_path, segments, with_subtitles=False)
 
-        graph = cmd[cmd.index("-filter_complex") + 1]
-        assert "subtitles=" not in graph
-        assert graph.split(";")[-2].endswith("concat=n=2:v=1:a=0[vout]")
+        vf = cmd[cmd.index("-vf") + 1]
+        assert "subtitles=" not in vf
+        assert vf.endswith("scale=1080:1920,setsar=1")

@@ -130,8 +130,9 @@ class CroppingConfig(BaseModel):
     # Frame decoding for the face detector: auto = VAAPI (Intel/AMD GPU) if a
     # test decode works, else the CPU; software = always the CPU.
     frame_decoder: Literal["auto", "software", "vaapi"] = "auto"
-    # Within one shot (no cut) the window moves only if the face shifts by more
-    # than this share of the crop width; smaller moves would look like a jerk.
+    # Within one shot (no cut) the window holds until the face moves farther
+    # than this share of the crop width from where it stands, then pans after
+    # the speaker; smaller moves would look like a jerk.
     min_reframe_share: float = Field(default=0.25, ge=0.0, le=1.0)
 
 

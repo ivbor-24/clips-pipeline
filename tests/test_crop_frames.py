@@ -29,7 +29,7 @@ class TestFilterGraph:
         graph, complex_graph = _frames_filter(SOFTWARE_DECODER, 1, 10.0, 640)
         assert complex_graph
         assert graph.startswith("[0:v]fps=12.5,scale=640:-2:flags=area,split=2[a][b]")
-        assert "[a]fps=1[f]" in graph
+        assert "[a]fps=1:round=up:start_time=0[f]" in graph
         assert "[b]scale=320:-2,scdet=threshold=10.0[s]" in graph
 
     def test_vaapi_scales_on_the_gpu_and_downloads(self):
@@ -37,9 +37,12 @@ class TestFilterGraph:
         assert graph.startswith("[0:v]fps=12.5,scale_vaapi=w=640:h=-2,hwdownload,format=nv12,split")
 
     def test_without_cut_detection(self):
-        assert _frames_filter(SOFTWARE_DECODER, 1, 0.0, None) == ("fps=1", False)
+        assert _frames_filter(SOFTWARE_DECODER, 1, 0.0, None) == (
+            "fps=1:round=up:start_time=0",
+            False,
+        )
         assert _frames_filter(VAAPI, 1, 0.0, 640) == (
-            "fps=1,scale_vaapi=w=640:h=-2,hwdownload,format=nv12",
+            "fps=1:round=up:start_time=0,scale_vaapi=w=640:h=-2,hwdownload,format=nv12",
             False,
         )
 
@@ -82,6 +85,34 @@ class TestExtractCommand:
         frames, _ = extract_frames(video, 0.0, 2.0, 1, tmp_path / "f", 10.0, frame_width=160)
         assert len(frames) == 3
         assert cv2.imread(str(frames[0][1])).shape[1] == 160
+
+
+class TestSampleTiming:
+    """A sample labeled t shows the video at t, not half a second later."""
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+    @pytest.mark.parametrize("scene_threshold", [10.0, 0.0])
+    @pytest.mark.parametrize("start", [1.0, 1.3])
+    def test_sample_is_the_frame_at_its_time(self, tmp_path, scene_threshold, start):
+        import cv2
+
+        # Frame number n in the brightness of the two halves: 16 * (n // 16), 16 * (n % 16).
+        video = tmp_path / "counter.mp4"
+        number = "if(lt(X,W/2),16*floor(N/16),16*mod(N,16))"
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x32:r=25:d=8"]
+            + ["-vf", f"format=gray,geq=lum='{number}'", "-c:v", "libx264", "-qp", "0"]
+            + [str(video)],
+            check=True,
+        )
+
+        frames, _ = extract_frames(video, start, start + 5, 1, tmp_path / "f", scene_threshold)
+
+        assert len(frames) == 6
+        for t, path in frames:
+            image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            n = 16 * round(image[:, :32].mean() / 16) + round(image[:, 32:].mean() / 16)
+            assert n / 25 == pytest.approx(t, abs=0.09)  # was t + 0.46 s on average
 
 
 class TestFaceBoxScaling:

@@ -82,7 +82,7 @@ cropping:
   min_track_segment_sec: 2.0  # shorter crop segments merge into a neighbour
   scene_cut_threshold: 10  # ffmpeg scdet: crop switches exactly on shot cuts (0 = off)
   frame_decoder: "auto"  # auto (GPU decode via VAAPI if it works, else CPU) | software | vaapi
-  min_reframe_share: 0.25  # no cut: move the window only if the face shifts > 25% of its width
+  min_reframe_share: 0.25  # dead zone: pan after the face once it moved > 25% of the window
 
 # Rendering settings
 rendering:
