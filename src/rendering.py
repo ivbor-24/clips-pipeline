@@ -168,8 +168,8 @@ class VideoEncoder:
         if self.kind == "qsv":
             args = ["-c:v", self.name, "-preset", _QSV_PRESETS.get(preset, preset)]
             args += ["-global_quality", str(_QSV_GLOBAL_QUALITY)]
-            # Quick Sync refuses to open without a frame rate, and the concat
-            # of a multi-shot clip leaves none.
+            # Quick Sync refuses to open without a frame rate: it is set
+            # explicitly rather than relying on the filters to pass it on.
             return args + (["-r", fps] if _valid_fps(fps) else [])
         if self.kind == "vaapi":
             return ["-c:v", self.name, "-rc_mode", "CQP", "-qp", str(_VAAPI_QP)]
@@ -660,6 +660,38 @@ def _escape_filter_path(path: Path) -> str:
     return str(path).replace(":", "\\:").replace("'", "'\\\\''")
 
 
+# A frame within this many seconds of a segment start belongs to the new
+# segment: segment times are rounded to milliseconds, frames are >= 16 ms apart.
+_SWITCH_EARLY_SEC = 0.005
+
+
+def _position_expr(segments: List[Tuple[float, List[Tuple[float, int]]]]) -> str:
+    """ffmpeg expression of a window position over the clip time ``t``.
+
+    segments: (start, [(t, position), ...]) in clip time, in order; positions
+    are linear between a segment's keyframes and held outside them, and
+    switch in one frame at the next segment's start (a cut). Written as the
+    first position plus a ramp per pan and a step per switch: a flat sum, so
+    any number of keyframes stays within the expression parser's depth limit,
+    and integer positions keep the sum exact after every ramp.
+    """
+    current = segments[0][1][0][1]
+    terms = [str(current)]
+    for index, (start, keys) in enumerate(segments):
+        if index and keys[0][1] != current:
+            terms.append(f"{keys[0][1] - current:+d}*gte(t,{start - _SWITCH_EARLY_SEC:.3f})")
+        current = keys[0][1]
+        for (t0, p0), (t1, p1) in zip(keys, keys[1:]):
+            if p1 != p0:
+                duration = round(t1 - t0, 3)
+                if duration > 0:
+                    terms.append(f"{p1 - p0:+d}*clip((t-{t0:.3f})/{duration:.3f},0,1)")
+                else:
+                    terms.append(f"{p1 - p0:+d}*gte(t,{t0:.3f})")
+            current = p1
+    return "".join(terms)
+
+
 def build_crop_filter(
     crop_params: Dict[str, Any],
     video_width: int,
@@ -667,63 +699,55 @@ def build_crop_filter(
     output_width: int,
     output_height: int,
     clip_start: float = 0.0,
-) -> Tuple[str, Optional[str]]:
+) -> str:
     """
-    Build the video crop/scale filtergraph for vertical output.
+    Build the video crop/scale filter chain for vertical output.
 
     crop_params["segments"] (optional) contains tracking segments with
-    absolute video timestamps and per-segment face centers. When multiple
-    segments exist, each is trimmed and cropped with its own window and the
-    branches are concatenated, so shot/zoom changes in the source are
-    followed instead of averaged into one wrong box.
+    absolute video timestamps and per-segment face centers; a segment whose
+    window pans after the speaker also has "path" keyframes. With several
+    segments or a path, one crop filter moves its window over time (x and y
+    are expressions of t, evaluated per frame): it pans along each path and
+    switches on the frame where the next segment starts, so shot/zoom changes
+    in the source are followed instead of averaged into one wrong box.
 
-    Returns (filter_str, output_label):
-      - single window: linear chain ("crop=...,scale=...,setsar=1"), label None
-      - multi-segment: trim/.../concat graph, label "vout"
+    Returns a linear chain: "crop=...,scale=...,setsar=1".
     """
     segments = crop_params.get("segments") or []
     frames = crop_params.get("frames") or []
+    tail = f"scale={output_width}:{output_height},setsar=1"
 
-    def seg_cx_cy(seg: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-        if seg.get("has_face"):
-            return seg.get("cx"), seg.get("cy")
-        return None, None
+    def window(cx: Optional[float], cy: Optional[float]) -> Tuple[int, int, int, int]:
+        return _strip_crop_window(video_width, video_height, output_width, output_height, cx, cy)
 
-    if len(segments) > 1:
-        branches = []
-        labels = []
-        for i, seg in enumerate(segments):
-            cx, cy = seg_cx_cy(seg)
-            w, h, x, y = _strip_crop_window(
-                video_width, video_height, output_width, output_height, cx, cy
-            )
-            start_t = round(seg.get("start", 0.0) - clip_start, 3)
-            end_t = round(seg.get("end", clip_start) - clip_start, 3)
-            label = f"[v{i}]"
-            labels.append(label)
-            branches.append(
-                f"trim=start={start_t}:end={end_t},setpts=PTS-STARTPTS,"
-                f"crop={w}:{h}:{x}:{y},scale={output_width}:{output_height},setsar=1{label}"
-            )
-        graph = ";".join(f"[0:v]{branch}" for branch in branches)
-        graph += f";{''.join(labels)}concat=n={len(branches)}:v=1:a=0[vout]"
-        return graph, "vout"
+    if len(segments) > 1 or any(seg.get("has_face") and seg.get("path") for seg in segments):
+        xs: List[Tuple[float, List[Tuple[float, int]]]] = []
+        ys: List[Tuple[float, List[Tuple[float, int]]]] = []
+        for seg in segments:
+            start = seg.get("start", clip_start) - clip_start
+            cx, cy = (seg.get("cx"), seg.get("cy")) if seg.get("has_face") else (None, None)
+            points = [(start, cx)]
+            if seg.get("has_face") and seg.get("path"):
+                points = [(t - clip_start, path_cx) for t, path_cx in seg["path"]]
+            corners = [(t, window(px, cy)) for t, px in points]
+            xs.append((start, [(t, win[2]) for t, win in corners]))
+            ys.append((start, [(t, win[3]) for t, win in corners]))
+        w, h, _, _ = window(None, None)
+        return f"crop=w={w}:h={h}:x='{_position_expr(xs)}':y='{_position_expr(ys)}':exact=1,{tail}"
 
     # Single window: face center from the only segment or from frames.
     cx = cy = None
     if segments:
-        cx, cy = seg_cx_cy(segments[0])
+        if segments[0].get("has_face"):
+            cx, cy = segments[0].get("cx"), segments[0].get("cy")
     elif frames:
         confident = [f for f in frames if f.get("conf", 0) > 0]
         if confident:
             cx = sum(f["x"] + f["w"] / 2 for f in confident) / len(confident)
             cy = sum(f["y"] + f["h"] / 2 for f in confident) / len(confident)
 
-    w, h, x, y = _strip_crop_window(video_width, video_height, output_width, output_height, cx, cy)
-    return (
-        f"crop={w}:{h}:{x}:{y},scale={output_width}:{output_height},setsar=1",
-        None,
-    )
+    w, h, x, y = window(cx, cy)
+    return f"crop={w}:{h}:{x}:{y},{tail}"
 
 
 def build_audio_loudnorm_filter(config: RenderingConfig) -> str:
@@ -762,7 +786,7 @@ def build_render_command(
         "segments": clip_params.get("segments", []),
         "fallback": clip_params.get("fallback", "center_crop"),
     }
-    video_graph, video_label = build_crop_filter(
+    video_filter = build_crop_filter(
         crop_params_for_clip,
         video_info.get("width", 1920),
         video_info.get("height", 1080),
@@ -780,38 +804,16 @@ def build_render_command(
                 subtitle_filter += f":fontsdir='{_escape_filter_path(Path(fonts_dir))}'"
         else:
             subtitle_filter = f"subtitles='{subtitle_escaped}'"
-        if video_label:
-            video_graph += f";[{video_label}]{subtitle_filter}[vout]"
-            video_label = "vout"
-        else:
-            video_graph += f",{subtitle_filter}"
+        video_filter += f",{subtitle_filter}"
 
     upload = encoder.filter_suffix()
     if upload:
-        if video_label:
-            video_graph += f";[{video_label}]{upload}[venc]"
-            video_label = "venc"
-        else:
-            video_graph += f",{upload}"
+        video_filter += f",{upload}"
 
     audio_filter = build_audio_loudnorm_filter(config.rendering)
 
     cmd = ["ffmpeg", *encoder.input_args(), "-ss", str(start), "-i", str(video_path)]
-    cmd += ["-t", str(duration)]
-
-    if video_label:
-        # Multi-segment graph: video branches + concat, audio loudnorm.
-        cmd += [
-            "-filter_complex",
-            video_graph + f";[0:a]{audio_filter}[aout]",
-            "-map",
-            f"[{video_label}]",
-            "-map",
-            "[aout]",
-        ]
-    else:
-        cmd += ["-vf", video_graph, "-af", audio_filter]
-
+    cmd += ["-t", str(duration), "-vf", video_filter, "-af", audio_filter]
     cmd += encoder.output_args(config.rendering.video_preset, video_info.get("fps"))
     cmd += [
         "-c:a",
@@ -1101,7 +1103,8 @@ def generate_manifest(
 
 
 # Bump when the ffmpeg command changes in a way that changes the clip.
-_RENDER_KEY_VERSION = 1
+# 2: one moving crop window instead of trimmed segments joined by concat.
+_RENDER_KEY_VERSION = 2
 
 
 def clip_render_key(

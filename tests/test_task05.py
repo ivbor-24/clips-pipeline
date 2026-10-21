@@ -676,7 +676,7 @@ class TestExtractFrames:
         assert run_mock.call_count == 1
         cmd = run_mock.call_args.args[0]
         assert cmd.index("-ss") < cmd.index("-i")
-        assert cmd[cmd.index("-vf") + 1] == "fps=1"
+        assert cmd[cmd.index("-vf") + 1] == "fps=1:round=up:start_time=0"
         assert cmd[cmd.index("-frames:v") + 1] == "3"
         assert [t for t, _ in frames] == [10.0, 11.0, 12.0]
 
@@ -819,7 +819,8 @@ class TestReframeWithoutCut:
 
         assert [(s["start"], s["end"]) for s in segments] == [(0.0, 30.0)]
 
-    def test_large_move_without_cut_reframes(self):
+    def test_large_move_without_cut_pans(self):
+        """The window pans to the new place instead of jumping with no cut to hide it."""
         from src.face_cropping import build_track_segments
 
         frames = [_face(t, 1100, 153) for t in range(15)] + [
@@ -827,7 +828,12 @@ class TestReframeWithoutCut:
         ]
         segments = build_track_segments(frames, 0.0, 30.0, cuts=[], window_width=607.5)
 
-        assert len(segments) == 2
+        assert len(segments) == 1
+        assert _window_center(segments, 10.0) == pytest.approx(1100, abs=2)
+        assert _window_center(segments, 20.0) == pytest.approx(1400, abs=2)
+        track = _track(segments, 30.0)
+        steps = [abs(b - a) for a, b in zip(track, track[1:])]
+        assert max(steps) < 300 / 25  # 300 px take more than a second
 
     def test_without_cut_detection_behaviour_is_unchanged(self):
         from src.face_cropping import build_track_segments
@@ -835,3 +841,185 @@ class TestReframeWithoutCut:
         segments = build_track_segments(self._frames(1488), 0.0, 30.0, window_width=607.5)
 
         assert len(segments) == 3
+
+
+def _window_center(segments, t):
+    """Window center x at time t: the segment's path, or its still center."""
+    from src.face_cropping import _interpolate
+
+    segment = next((s for s in segments if s["start"] <= t < s["end"]), segments[-1])
+    path = segment.get("path")
+    if not path:
+        return segment["cx"]
+    return _interpolate([k[0] for k in path], [k[1] for k in path], t)
+
+
+def _track(segments, duration, fps=25):
+    """Window center on every frame of a clip starting at 0."""
+    return [_window_center(segments, n / fps) for n in range(int(duration * fps))]
+
+
+def _walk(t):
+    """Stands at 800, walks to 1300 at 125 px/s (6-10 s), stands, walks back (14-18 s)."""
+    if t < 6:
+        return 800.0
+    if t < 10:
+        return 800 + 125 * (t - 6)
+    if t < 14:
+        return 1300.0
+    if t < 18:
+        return 1300 - 125 * (t - 14)
+    return 800.0
+
+
+class TestWindowFollowsTheSpeaker:
+    """Within a shot the window pans after a speaker who moves (camera_path)."""
+
+    def _segments(self, frames, end, **kwargs):
+        from src.face_cropping import build_track_segments
+
+        kwargs.setdefault("cuts", [])
+        return build_track_segments(
+            frames, 0.0, end, window_width=607.5, frame_width=1920, **kwargs
+        )
+
+    def test_walk_is_followed_without_a_jump(self):
+        segments = self._segments([_face(t, _walk(t), 150) for t in range(21)], 20.0)
+
+        assert len(segments) == 1 and segments[0]["path"]
+        track = _track(segments, 20.0)
+        offsets = [abs(x - _walk(n / 25)) for n, x in enumerate(track)]
+        assert max(offsets) < 40  # was 500: the window stayed put until the speaker left it
+        steps = [abs(b - a) for a, b in zip(track, track[1:])]
+        assert max(steps) < 140 / 25  # never faster than the speaker (125 px/s)
+
+    def test_window_is_still_while_the_speaker_stands(self):
+        segments = self._segments([_face(t, _walk(t), 150) for t in range(21)], 20.0)
+
+        for start, end, x in ((0.0, 4.0, 800), (11.5, 12.5, 1300), (19.5, 20.0, 800)):
+            track = [
+                _window_center(segments, start + k / 25) for k in range(int((end - start) * 25))
+            ]
+            assert max(track) - min(track) < 1.5
+            assert track[0] == pytest.approx(x, abs=2)
+
+    def test_slow_drift_is_a_steady_pan(self):
+        segments = self._segments([_face(t, 700 + 20 * t, 150) for t in range(31)], 30.0)
+
+        track = _track(segments, 30.0)
+        assert max(abs(x - (700 + 20 * n / 25)) for n, x in enumerate(track)) < 5
+
+    def test_lost_face_holds_the_window(self):
+        """The speaker turned away for 4 s: no swing to the frame center and back."""
+        frames = [_no_face(t) if 8 <= t < 12 else _face(t, 1300, 150) for t in range(21)]
+
+        segments = self._segments(frames, 20.0)
+
+        assert len(segments) == 1
+        assert segments[0]["has_face"] and segments[0]["cx"] == 1300.0
+        assert "path" not in segments[0]
+
+    def test_lost_face_without_cut_detection_keeps_its_segment(self):
+        frames = [_no_face(t) if 8 <= t < 12 else _face(t, 1300, 150) for t in range(21)]
+
+        segments = self._segments(frames, 20.0, cuts=None)
+
+        assert [s["has_face"] for s in segments] == [True, False, True]
+
+    def test_cut_still_switches_in_one_frame(self):
+        frames = [_face(t, _walk(t), 150) for t in range(13)]
+        frames += [_face(t, 600, 300) for t in range(13, 21)]
+
+        segments = self._segments(frames, 20.0, cuts=[12.4])
+
+        assert [(s["start"], s["end"]) for s in segments] == [(0.0, 12.4), (12.4, 20.0)]
+        assert segments[0]["path"] and "path" not in segments[1]
+        assert _window_center(segments, 12.36) == pytest.approx(1300, abs=40)
+        assert _window_center(segments, 12.4) == 600.0
+
+    def test_new_framing_without_cut_still_switches(self):
+        """A zoom or a cut scdet missed: the face size changes."""
+        frames = [_face(t, 1300, 150) for t in range(10)] + [
+            _face(t, 800, 300) for t in range(10, 21)
+        ]
+
+        segments = self._segments(frames, 20.0)
+
+        assert [s["cx"] for s in segments] == [1300.0, 800.0]
+
+    def test_window_stays_inside_the_frame(self):
+        frames = [_face(t, 1000 - 80 * t, 150) for t in range(11)]  # walks off to x=200
+
+        segments = self._segments(frames, 10.0)
+
+        assert min(k[1] for k in segments[0]["path"]) == pytest.approx(607.5 / 2, abs=0.1)
+
+    def test_two_stray_boxes_do_not_move_the_window(self):
+        frames = [_face(t, 400, 150) if t in (7, 8) else _face(t, 1300, 150) for t in range(21)]
+
+        segments = self._segments(frames, 20.0)
+
+        assert len(segments) == 1 and segments[0]["cx"] == 1300.0
+        assert "path" not in segments[0]
+
+    def test_no_path_without_window_width(self):
+        from src.face_cropping import build_track_segments
+
+        frames = [_face(t, _walk(t), 150) for t in range(21)]
+
+        assert all("path" not in s for s in build_track_segments(frames, 0.0, 20.0))
+
+    def test_process_clip_segment_follows_a_walk(self, tmp_path):
+        from src.config import CroppingConfig
+        from src.face_cropping import process_clip_segment
+
+        def detection(t):
+            cx = _walk(t)
+            return {"x": int(cx - 75), "y": 100, "w": 150, "h": 210, "conf": 0.9}
+
+        sampled = [(100.0 + k, tmp_path / f"frame_{k:04d}.jpg") for k in range(21)]
+        with (
+            patch("src.face_cropping.extract_frames", return_value=(sampled, [])),
+            patch(
+                "src.face_cropping.detect_faces_in_frame",
+                side_effect=[detection(k) for k in range(21)],
+            ),
+        ):
+            params = process_clip_segment(
+                tmp_path / "video.mp4",
+                {"id": "clip_001", "start": 100.0, "end": 120.0},
+                {"width": 1920, "height": 1080},
+                MagicMock(),
+                CroppingConfig(),
+                tmp_path,
+            )
+
+        path = params.segments[0]["path"]
+        assert path[0][0] == 100.0 and path[-1][0] == 120.0
+        assert max(k[1] for k in path) == pytest.approx(1300, abs=3)
+
+
+class TestCameraPathHelpers:
+    def test_still_face_needs_no_path(self):
+        from src.face_cropping import camera_path
+
+        centers = [1000 + (15 if t % 2 else -15) for t in range(21)]  # detection jitter
+
+        assert camera_path(list(range(21)), centers, 0.0, 20.0, 607.5) is None
+
+    def test_running_median_keeps_a_walk_and_drops_strays(self):
+        from src.face_cropping import _running_median
+
+        assert _running_median([float(x) for x in range(0, 100, 10)], 2) == [
+            float(x) for x in range(0, 100, 10)
+        ]
+        assert (
+            _running_median([900.0, 100, 100, 100, 900, 900, 100, 100, 100, 900], 2) == [100.0] * 10
+        )
+
+    def test_simplify_keeps_the_corners(self):
+        from src.face_cropping import _simplify
+
+        points = [(t / 10, 0.0) for t in range(11)] + [(1 + t / 10, t * 10.0) for t in range(1, 11)]
+
+        assert _simplify(points, 0.5) == [(0.0, 0.0), (1.0, 0.0), (2.0, 100.0)]

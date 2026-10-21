@@ -12,7 +12,9 @@ Outputs:
 - artifacts/crop_params.json (list of clip crop parameters with frames and fallback info)
 """
 
+import bisect
 import json
+import math
 import os
 import re
 import shutil
@@ -54,7 +56,8 @@ class ClipCropParams:
     fallback: str = "center_crop"
     fallback_ratio: float = 0.0
     # Tracking segments: [{"start", "end", "cx", "cy", "has_face"}] with
-    # absolute video timestamps. Each segment gets its own crop window so
+    # absolute video timestamps, plus "path" ([[t, cx], ...]) when the window
+    # pans after the speaker. Each segment gets its own crop window so
     # shot/zoom changes in the source are followed instead of averaged away.
     segments: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -154,17 +157,29 @@ class FrameDecoder:
 SOFTWARE_DECODER = FrameDecoder()
 
 
+def _sampling_fps(fps: float) -> str:
+    """The fps filter that takes the frame at each tick k / fps.
+
+    With its default rounding the filter outputs the last frame before the
+    middle of the next interval: at 1 fps the sample labeled k s showed the
+    video at k + 0.46 s on average, so the crop followed the face half a
+    second early. Rounding up takes the last frame at or before the tick;
+    start_time=0 keeps tick 0 when -ss lands between two frames.
+    """
+    return f"fps={fps}:round=up:start_time=0"
+
+
 def _frames_filter(
     decoder: FrameDecoder, fps: float, scene_threshold: float, frame_width: Optional[int]
 ) -> Tuple[str, bool]:
     """The filtergraph of extract_frames; True if it is a complex graph ([f] and [s])."""
     if scene_threshold <= 0:
-        chain = [f"fps={fps}"] + decoder.downscale(frame_width)
+        chain = [_sampling_fps(fps)] + decoder.downscale(frame_width)
         return ",".join(chain), False
     analysis_fps = max(SCENE_FPS, fps)
     head = ",".join([f"fps={analysis_fps}"] + decoder.downscale(frame_width))
     graph = (
-        f"[0:v]{head},split=2[a][b];[a]fps={fps}[f];"
+        f"[0:v]{head},split=2[a][b];[a]{_sampling_fps(fps)}[f];"
         f"[b]scale=320:-2,scdet=threshold={scene_threshold}[s]"
     )
     return graph, True
@@ -573,6 +588,194 @@ def _group_box(group: List[FrameCropInfo]) -> Optional[Tuple[float, float, float
     )
 
 
+# The window inside one shot moves like a camera operator. A still window per
+# segment jumped: it stayed put while the speaker walked out of it, then moved
+# in one go on the next segment. Now a camera that holds until the face leaves
+# its dead zone (cropping.min_reframe_share of the window width) and stops
+# once the face has been still for SETTLE_SEC marks when the window moves; it
+# is run forward and backward in time, so a move covers the whole walk, from
+# the first step to the stop. While moving the window follows the smoothed
+# face; between moves it holds, on the line from where the face was when one
+# move ended to where it is when the next starts: still for a speaker who
+# stands, a steady slow pan for one who drifts.
+PATH_STEP = 0.1  # s, grid of the camera path
+FACE_SMOOTHING_SEC = 0.5  # Gaussian sigma over the face track (1-s samples, linear between)
+PATH_SMOOTHING_SEC = 0.3  # ... and over the path: a pan eases in and out of a hold
+SETTLE_SEC = 1.0  # the camera stops once the face stayed this long ...
+_SETTLE_SHARE = 0.03  # ... within this share of the window width
+PATH_TOLERANCE_PX = 0.5  # the line between path keyframes stays this close to the path
+# Face centers pass a running median over this many seconds on each side
+# first: a stray box (another face, a false detection) lasting up to that
+# long does not send the camera after it.
+OUTLIER_SEC = 2.0
+
+
+def _running_median(values: Sequence[float], radius: int) -> List[float]:
+    """Median of each value and up to ``radius`` neighbours on each side.
+
+    The window shrinks symmetrically at the ends, so a steady walk is kept as
+    it is; an end value is the median of itself, its neighbour and the
+    neighbour's mirror (2 * next - next but one), which drops a stray end box.
+    """
+    n = len(values)
+    if radius < 1 or n < 3:
+        return list(values)
+    result = []
+    for i in range(n):
+        m = min(radius, i, n - 1 - i)
+        if m:
+            result.append(statistics.median(values[i - m : i + m + 1]))
+        else:
+            near, far = (values[1], values[2]) if i == 0 else (values[-2], values[-3])
+            result.append(statistics.median([values[i], near, 2 * near - far]))
+    return result
+
+
+def _interpolate(times: Sequence[float], values: Sequence[float], t: float) -> float:
+    """Linear interpolation of values at t, held before the first and after the last time."""
+    if t <= times[0]:
+        return values[0]
+    if t >= times[-1]:
+        return values[-1]
+    hi = bisect.bisect_left(times, t)
+    t0, t1 = times[hi - 1], times[hi]
+    return values[hi - 1] + (values[hi] - values[hi - 1]) * (t - t0) / (t1 - t0)
+
+
+def _moves(face: Sequence[float], dead_zone: float, still: float) -> List[bool]:
+    """Where a camera on the PATH_STEP grid moves (causal, see PATH_STEP).
+
+    It holds until the face is farther than ``dead_zone`` from where it
+    settled, then moves until the face has stayed within ``still`` for
+    SETTLE_SEC and settles there.
+    """
+    settle = max(1, round(SETTLE_SEC / PATH_STEP))
+    hold, moving, marks = face[0], False, []
+    for i, x in enumerate(face):
+        if not moving:
+            moving = abs(x - hold) > dead_zone
+        elif i >= settle and max(face[i - settle : i + 1]) - min(face[i - settle : i + 1]) <= still:
+            moving, hold = False, x
+        marks.append(moving)
+    return marks
+
+
+def _hold_between_moves(face: Sequence[float], moving: Sequence[bool]) -> List[float]:
+    """The face position while moving; a straight line from move to move between them."""
+    path = list(face)
+    n, i = len(face), 0
+    while i < n:
+        if moving[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not moving[j]:
+            j += 1
+        if i == 0 and j == n:
+            left = right = statistics.median(face)
+        else:
+            left = face[i - 1] if i > 0 else face[j]
+            right = face[j] if j < n else face[i - 1]
+        for k in range(i, j):
+            path[k] = left + (right - left) * (k - i + 1) / (j - i + 1)
+        i = j
+    return path
+
+
+def _gaussian_smooth(values: Sequence[float], sigma: float) -> List[float]:
+    """Gaussian blur of values on the PATH_STEP grid.
+
+    Beyond the ends the values are mirrored about the end value (2 * end -
+    value), so a pan running at an end keeps its speed instead of easing out.
+    """
+    radius = int(3 * sigma / PATH_STEP)
+    n = len(values)
+    if radius < 1 or n < 2:
+        return list(values)
+    offsets = range(-radius, radius + 1)
+    weights = [math.exp(-0.5 * (k * PATH_STEP / sigma) ** 2) for k in offsets]
+    total = sum(weights)
+
+    def value(i: int) -> float:
+        if i < 0:
+            return 2 * values[0] - values[min(-i, n - 1)]
+        if i >= n:
+            return 2 * values[-1] - values[max(2 * (n - 1) - i, 0)]
+        return values[i]
+
+    return [sum(w * value(i + k) for k, w in zip(offsets, weights)) / total for i in range(n)]
+
+
+def _simplify(points: List[Tuple[float, float]], tolerance: float) -> List[Tuple[float, float]]:
+    """Fewest points of a (t, x) polyline that stay within tolerance of it (Douglas-Peucker)."""
+    keep = [False] * len(points)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(points) - 1)]
+    while stack:
+        lo, hi = stack.pop()
+        (t0, x0), (t1, x1) = points[lo], points[hi]
+        worst, worst_i = tolerance, None
+        for i in range(lo + 1, hi):
+            t, x = points[i]
+            off = abs(x - (x0 + (x1 - x0) * (t - t0) / (t1 - t0)))
+            if off > worst:
+                worst, worst_i = off, i
+        if worst_i is not None:
+            keep[worst_i] = True
+            stack += [(lo, worst_i), (worst_i, hi)]
+    return [p for p, k in zip(points, keep) if k]
+
+
+def camera_path(
+    times: Sequence[float],
+    centers: Sequence[float],
+    start: float,
+    end: float,
+    window_width: float,
+    frame_width: Optional[float] = None,
+    dead_zone_share: float = 0.25,
+) -> Optional[List[List[float]]]:
+    """
+    The window center over one shot as [[t, cx], ...] keyframes, linear between them.
+
+    Args:
+        times: Face sample times (absolute seconds, ascending).
+        centers: Face center x at those times (source pixels).
+        start: Shot start; end: shot end (absolute seconds).
+        window_width: Crop window width (source pixels).
+        frame_width: Video width: the window stays inside it. None: no limit.
+        dead_zone_share: The window holds until the face moves farther than
+            this share of the window width from where it stood.
+
+    Returns:
+        Keyframes from start to end, or None if one still window fits the
+        shot: the face moves less than the dead zone over all of it.
+    """
+    if not times or end - start < PATH_STEP:
+        return None
+    interval = statistics.median(b - a for a, b in zip(times, times[1:])) if len(times) > 1 else 1
+    targets = _running_median(centers, round(OUTLIER_SEC / max(interval, 1e-3)))
+    dead_zone = dead_zone_share * window_width
+    if max(targets) - min(targets) <= dead_zone:
+        return None
+
+    steps = math.ceil((end - start) / PATH_STEP - 1e-9)
+    grid = [start + (end - start) * i / steps for i in range(steps + 1)]
+    face = _gaussian_smooth([_interpolate(times, targets, t) for t in grid], FACE_SMOOTHING_SEC)
+    still = _SETTLE_SHARE * window_width
+    forward = _moves(face, dead_zone, still)
+    backward = _moves(face[::-1], dead_zone, still)[::-1]
+    moving = [a or b for a, b in zip(forward, backward)]
+    path = _gaussian_smooth(_hold_between_moves(face, moving), PATH_SMOOTHING_SEC)
+    if frame_width is not None:
+        lo, hi = window_width / 2, max(frame_width - window_width / 2, window_width / 2)
+        path = [min(max(x, lo), hi) for x in path]
+    if max(path) - min(path) < 1.0:
+        return None  # pinned to a frame edge
+    keys = _simplify(list(zip(grid, path)), PATH_TOLERANCE_PX)
+    return [[round(t, 3), round(x, 1)] for t, x in keys]
+
+
 def build_track_segments(
     frames: List[FrameCropInfo],
     clip_start: float,
@@ -583,6 +786,7 @@ def build_track_segments(
     cuts: Optional[Sequence[float]] = None,
     window_width: Optional[float] = None,
     min_reframe_share: float = 0.25,
+    frame_width: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """
     Group consecutive detection frames into tracking segments.
@@ -593,6 +797,8 @@ def build_track_segments(
     jumps, or when the face appears/disappears. Segments shorter than
     ``min_segment_sec`` (a missed detection, a stray box) merge into the
     longer neighbour; neighbours that then show the same shot are joined.
+    Within a segment the window follows the face (camera_path) if it moves
+    beyond the dead zone.
 
     Args:
         frames: Raw per-sample detections (conf == 0 means no face).
@@ -607,16 +813,22 @@ def build_track_segments(
             so the window switches on the cut instead of up to a sample
             interval later (a wrong crop flashing for a fraction of a second).
             None = cut detection was not run.
-        window_width: Crop window width in source pixels. With cuts known,
-            a boundary without a cut (the speaker moved within one shot) is
-            kept only if the face center shifts by more than
-            min_reframe_share of it; otherwise the window would jerk with no
-            cut to hide the move.
-        min_reframe_share: See window_width.
+        window_width: Crop window width in source pixels; None: still windows.
+            With cuts known, segments between two cuts form one shot: the
+            window pans after a speaker who moved instead of jumping with no
+            cut to hide the move, and holds over stretches where the face was
+            not found. Only a change of the face size (a zoom, a cut scdet
+            missed) still switches the window without a cut.
+        min_reframe_share: Dead zone of the camera (camera_path): the window
+            moves once the face moves farther than this share of the window
+            width from where it stood.
+        frame_width: Video width: a panning window stays inside the frame.
 
     Returns:
         List of {"start", "end", "cx", "cy", "has_face"} with absolute video
         timestamps; cx/cy are the median face center, None without a face.
+        A segment whose window pans also has "path": [[t, cx], ...], the
+        window center at absolute times, linear in between.
     """
     if not frames:
         return [{"start": clip_start, "end": clip_end, "cx": None, "cy": None, "has_face": False}]
@@ -677,8 +889,9 @@ def build_track_segments(
     on_cut = [True] * len(groups)
     for i in range(1, len(groups)):
         prev_last, next_first = groups[i - 1][-1].time, groups[i][0].time
-        # The fps filter takes the frame nearest to each tick, so a sample
-        # may show up to half an interval after its nominal time.
+        # Half an interval of slack on each side: a cut found right next to a
+        # sample (scdet runs at SCENE_FPS, its time may be a frame off) still
+        # moves the boundary.
         half = (next_first - prev_last) / 2
         between = [c for c in (cuts or ()) if prev_last - half < c <= next_first + half]
         if between:
@@ -686,38 +899,56 @@ def build_track_segments(
         else:
             on_cut[i] = False
 
-    if cuts is not None and window_width:
-        # Same shot (no cut), same framing, small move: keep one window.
-        kept_groups, kept_bounds = [groups[0]], [bounds[0]]
-        for group, bound, cut in zip(groups[1:], bounds[1:], on_cut[1:]):
-            a, b = _group_box(kept_groups[-1]), _group_box(group)
-            small_move = (
-                not cut
-                and a is not None
-                and b is not None
-                and max(a[2], b[2]) / max(min(a[2], b[2]), 1.0) <= size_ratio_threshold
-                and abs(a[0] - b[0]) < min_reframe_share * window_width
-            )
-            if small_move:
-                kept_groups[-1] = kept_groups[-1] + group
-                kept_bounds[-1][1] = bound[1]
-            else:
-                kept_groups.append(group)
-                kept_bounds.append(bound)
-        groups, bounds = kept_groups, kept_bounds
+    # Groups between two cuts are one shot: the speaker moved or was not found
+    # for a while, the camera did not change. Without cut detection every
+    # boundary may be a cut, so each group keeps its own window.
+    shots: List[List[List[FrameCropInfo]]] = [[groups[0]]]
+    shot_bounds = [bounds[0]]
+    for group, bound, cut in zip(groups[1:], bounds[1:], on_cut[1:]):
+        same_shot = cuts is not None and bool(window_width) and not cut
+        b = _group_box(group)
+        faces = [box for box in map(_group_box, shots[-1]) if box is not None]
+        if same_shot and b is not None and faces:
+            a = faces[-1]  # a new framing (zoom, missed cut) still switches the window
+            same_shot = max(a[2], b[2]) / max(min(a[2], b[2]), 1.0) <= size_ratio_threshold
+        if same_shot:
+            shots[-1].append(group)
+            shot_bounds[-1][1] = bound[1]
+        else:
+            shots.append([group])
+            shot_bounds.append(bound)
 
     result = []
-    for (seg_start, seg_end), group in zip(bounds, groups):
-        center = _group_box(group)
-        result.append(
-            {
-                "start": seg_start,
-                "end": seg_end,
-                "cx": round(center[0], 1) if center else None,
-                "cy": round(center[1], 1) if center else None,
-                "has_face": center is not None,
-            }
-        )
+    for (seg_start, seg_end), shot in zip(shot_bounds, shots):
+        # Faces of the groups where they are the majority lead the window; it
+        # holds over the rest of the shot (camera_path).
+        samples = [f for g in shot if _group_box(g) is not None for f in g if f.conf > 0]
+        segment: Dict[str, Any] = {
+            "start": seg_start,
+            "end": seg_end,
+            "cx": None,
+            "cy": None,
+            "has_face": bool(samples),
+        }
+        if samples:
+            segment["cx"] = round(statistics.median(f.x + f.w / 2 for f in samples), 1)
+            segment["cy"] = round(statistics.median(f.y + f.h / 2 for f in samples), 1)
+            path = (
+                camera_path(
+                    [f.time for f in samples],
+                    [f.x + f.w / 2 for f in samples],
+                    seg_start,
+                    seg_end,
+                    window_width,
+                    frame_width,
+                    min_reframe_share,
+                )
+                if window_width
+                else None
+            )
+            if path:
+                segment["path"] = path
+        result.append(segment)
 
     return result
 
@@ -892,6 +1123,7 @@ def process_clip_segment(
                 video_info["height"] * config.output_width / config.output_height,
             ),
             min_reframe_share=config.min_reframe_share,
+            frame_width=float(video_info["width"]),
         )
 
     return ClipCropParams(

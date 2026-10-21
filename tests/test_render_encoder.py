@@ -81,17 +81,18 @@ class TestBuildRenderCommand:
         assert vf.endswith(",format=nv12,hwupload")
         assert vf.index("ass=") < vf.index("hwupload")
 
-    def test_vaapi_multi_segment_maps_uploaded_stream(self, tmp_path):
+    def test_vaapi_moving_window_uploads_after_subtitles(self, tmp_path):
         encoder = VideoEncoder("h264_vaapi", "vaapi", "/dev/dri/renderD128")
         segments = [
             {"start": 10.0, "end": 40.0, "cx": 1300.0, "cy": 400.0, "has_face": True},
             {"start": 40.0, "end": 70.0, "cx": 800.0, "cy": 300.0, "has_face": True},
         ]
         cmd = self._cmd(tmp_path, encoder, segments)
-        graph = cmd[cmd.index("-filter_complex") + 1]
-        assert "[vout]format=nv12,hwupload[venc]" in graph
-        maps = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-map"]
-        assert maps == ["[venc]", "[aout]"]
+        vf = cmd[cmd.index("-vf") + 1]
+        assert vf.startswith("crop=w=608:h=1080:x='")
+        assert vf.index("ass=") < vf.index("hwupload")
+        assert vf.endswith(",format=nv12,hwupload")
+        assert "-filter_complex" not in cmd and "-map" not in cmd
 
     def test_software_has_no_upload(self, tmp_path):
         cmd = self._cmd(tmp_path, VideoEncoder("libx264"), [])
